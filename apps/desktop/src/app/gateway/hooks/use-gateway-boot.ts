@@ -57,6 +57,43 @@ interface GatewayBootOptions {
   refreshSessions: () => Promise<void>
 }
 
+const INITIAL_CONNECTION_ATTEMPTS = 10
+const INITIAL_BOOT_DATA_ATTEMPTS = 4
+const INITIAL_BOOT_RECOVERY_RETRY_DELAY_MS = 5_000
+const INITIAL_GATEWAY_CONNECT_ATTEMPTS = 3
+const INITIAL_GATEWAY_CONNECT_RETRY_DELAY_MS = 1_000
+const INITIAL_GATEWAY_CONNECT_MAX_RETRY_DELAY_MS = 15_000
+const RECOVERABLE_GATEWAY_RECONNECT_FAILURES = 6
+const RETRYABLE_INITIAL_REMOTE_AUTH_ERRORS = [
+  'Your remote gateway session has expired',
+  'Remote Hermes gateway uses OAuth, but you are not signed in'
+]
+const RETRYABLE_INITIAL_BOOT_ERRORS = [
+  ...RETRYABLE_INITIAL_REMOTE_AUTH_ERRORS,
+  'Timed out connecting to Hermes backend',
+  'Hermes backend did not become ready',
+  'Could not connect to Hermes gateway',
+  'Hermes gateway connection closed'
+]
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function messageIncludesAny(error: unknown, fragments: string[]) {
+  const message = getErrorMessage(error)
+
+  return fragments.some(fragment => message.includes(fragment))
+}
+
+function isRetryableInitialConnectionError(error: unknown) {
+  return messageIncludesAny(error, RETRYABLE_INITIAL_REMOTE_AUTH_ERRORS)
+}
+
+function isRetryableInitialBootError(error: unknown) {
+  return messageIncludesAny(error, RETRYABLE_INITIAL_BOOT_ERRORS)
+}
+
 export function useGatewayBoot({
   handleGatewayEvent,
   onConnectionReady,
@@ -105,9 +142,13 @@ export function useGatewayBoot({
     // signals that fire around wake (power resume, network online, the window
     // becoming visible).
     let bootCompleted = false
+    let bootingInitialGateway = false
+    let initialBootFailureNotified = false
+    let initialBootRetryTimer: ReturnType<typeof setTimeout> | null = null
     let reconnecting = false
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
     let reconnectAttempt = 0
+    let reconnectFailureCount = 0
     // Surface "sign in again" once per disconnect episode, not on every backoff
     // tick — a stale OAuth ticket fails every attempt and would otherwise stack
     // identical error toasts (and their haptics). Reset on the next clean open.
@@ -127,6 +168,84 @@ export function useGatewayBoot({
         clearTimeout(reconnectTimer)
         reconnectTimer = null
       }
+    }
+
+    const clearInitialBootRetryTimer = () => {
+      if (initialBootRetryTimer !== null) {
+        clearTimeout(initialBootRetryTimer)
+        initialBootRetryTimer = null
+      }
+    }
+
+    const waitForInitialGatewayRetry = (attempt: number) =>
+      new Promise<void>(resolve => {
+        setTimeout(
+          resolve,
+          Math.min(INITIAL_GATEWAY_CONNECT_MAX_RETRY_DELAY_MS, INITIAL_GATEWAY_CONNECT_RETRY_DELAY_MS * 2 ** attempt)
+        )
+      })
+
+    const getInitialConnection = async () => {
+      let lastError: unknown
+
+      for (let attempt = 0; attempt < INITIAL_CONNECTION_ATTEMPTS; attempt += 1) {
+        try {
+          return await desktop.getConnection()
+        } catch (err) {
+          lastError = err
+
+          if (cancelled || !isRetryableInitialConnectionError(err) || attempt === INITIAL_CONNECTION_ATTEMPTS - 1) {
+            throw err
+          }
+
+          await waitForInitialGatewayRetry(attempt)
+        }
+      }
+
+      throw lastError
+    }
+
+    const connectGatewayWithFreshUrl = async (conn: HermesConnection, attempts = 1) => {
+      let lastError: unknown
+
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+          const wsUrl = await resolveGatewayWsUrl(desktop, conn)
+          await gateway.connect(wsUrl)
+          return
+        } catch (err) {
+          lastError = err
+
+          if (cancelled || isGatewayReauthRequired(err) || attempt === attempts - 1) {
+            throw err
+          }
+
+          await waitForInitialGatewayRetry(attempt)
+        }
+      }
+
+      throw lastError
+    }
+
+    const runInitialBootDataStep = async (fn: () => Promise<void>) => {
+      let lastError: unknown
+
+      for (let attempt = 0; attempt < INITIAL_BOOT_DATA_ATTEMPTS; attempt += 1) {
+        try {
+          await fn()
+          return
+        } catch (err) {
+          lastError = err
+
+          if (cancelled || attempt === INITIAL_BOOT_DATA_ATTEMPTS - 1) {
+            throw err
+          }
+
+          await waitForInitialGatewayRetry(attempt)
+        }
+      }
+
+      throw lastError
     }
 
     const attemptReconnect = async () => {
@@ -158,14 +277,14 @@ export function useGatewayBoot({
         // mints a fresh ticket (or throws a reauth error in OAuth mode rather
         // than connecting with a stale one). For local/token gateways the URL
         // carries a long-lived token and the re-mint is a cheap no-op.
-        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
-        await gateway.connect(wsUrl)
+        await connectGatewayWithFreshUrl(conn)
 
         if (cancelled) {
           return
         }
 
         reconnectAttempt = 0
+        reconnectFailureCount = 0
         // Resync state that may have moved on the backend while we were asleep.
         await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
         await callbacksRef.current.refreshSessions().catch(() => undefined)
@@ -177,6 +296,14 @@ export function useGatewayBoot({
         if (!cancelled && isGatewayReauthRequired(err) && !reauthNotified) {
           reauthNotified = true
           notifyError(err, translateNow('boot.errors.gatewaySignInRequired'))
+        }
+
+        if (!cancelled && !isGatewayReauthRequired(err)) {
+          reconnectFailureCount += 1
+
+          if (reconnectFailureCount >= RECOVERABLE_GATEWAY_RECONNECT_FAILURES && !$desktopBoot.get().error) {
+            failDesktopBoot(translateNow('boot.errors.gatewayReconnectFailed'))
+          }
         }
       } finally {
         reconnecting = false
@@ -204,6 +331,27 @@ export function useGatewayBoot({
         reconnectTimer = null
         void attemptReconnect()
       }, delay)
+    }
+
+    function scheduleInitialBootRetry() {
+      if (cancelled || bootCompleted || initialBootRetryTimer !== null) {
+        return
+      }
+
+      initialBootRetryTimer = setTimeout(() => {
+        initialBootRetryTimer = null
+
+        if (cancelled || bootCompleted) {
+          return
+        }
+
+        setDesktopBootStep({
+          phase: 'renderer.boot',
+          message: translateNow('boot.steps.startingDesktopConnection'),
+          progress: 6
+        })
+        void boot()
+      }, INITIAL_BOOT_RECOVERY_RETRY_DELAY_MS)
     }
 
     const reconnectNow = () => {
@@ -246,6 +394,7 @@ export function useGatewayBoot({
 
       if (st === 'open') {
         reconnectAttempt = 0
+        reconnectFailureCount = 0
         reauthNotified = false
         escalated = false
         clearReconnectTimer()
@@ -332,8 +481,14 @@ export function useGatewayBoot({
     })
 
     async function boot() {
+      if (cancelled || bootCompleted || bootingInitialGateway) {
+        return
+      }
+
+      bootingInitialGateway = true
+
       try {
-        const conn = await desktop.getConnection()
+        const conn = await getInitialConnection()
 
         if (cancelled) {
           return
@@ -350,8 +505,7 @@ export function useGatewayBoot({
         // conn.wsUrl is stale; resolveGatewayWsUrl() re-mints it and, on
         // failure, throws a reauth error rather than connecting with a dead
         // ticket (which would surface as an opaque "connection closed").
-        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
-        await gateway.connect(wsUrl)
+        await connectGatewayWithFreshUrl(conn, INITIAL_GATEWAY_CONNECT_ATTEMPTS)
 
         if (cancelled) {
           return
@@ -382,8 +536,7 @@ export function useGatewayBoot({
           setCurrentCwd(remoteDefault.cwd)
           setCurrentBranch(remoteDefault.branch || '')
         }
-
-        await callbacksRef.current.refreshHermesConfig()
+        await runInitialBootDataStep(() => callbacksRef.current.refreshHermesConfig())
 
         if (cancelled) {
           return
@@ -394,16 +547,27 @@ export function useGatewayBoot({
           message: translateNow('boot.steps.loadingSessions'),
           progress: 99
         })
-        await callbacksRef.current.refreshSessions()
+        await runInitialBootDataStep(() => callbacksRef.current.refreshSessions())
         completeDesktopBoot()
         bootCompleted = true
+        initialBootFailureNotified = false
+        clearInitialBootRetryTimer()
       } catch (err) {
-        if (!cancelled) {
-          const message = err instanceof Error ? err.message : String(err)
+        if (!cancelled && !bootCompleted) {
+          const message = getErrorMessage(err)
           failDesktopBoot(message)
-          notifyError(err, translateNow('boot.errors.desktopBootFailed'))
+          if (!initialBootFailureNotified) {
+            notifyError(err, translateNow('boot.errors.desktopBootFailed'))
+            initialBootFailureNotified = true
+          }
           setSessionsLoading(false)
+
+          if (isRetryableInitialBootError(err)) {
+            scheduleInitialBootRetry()
+          }
         }
+      } finally {
+        bootingInitialGateway = false
       }
     }
 
@@ -411,6 +575,7 @@ export function useGatewayBoot({
 
     return () => {
       cancelled = true
+      clearInitialBootRetryTimer()
       clearReconnectTimer()
       clearInterval(keepaliveTimer)
       offWorking()

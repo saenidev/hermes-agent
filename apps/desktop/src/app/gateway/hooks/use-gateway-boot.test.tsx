@@ -27,6 +27,7 @@ class FakeWebSocket {
   // Flipped by the test: 'open' = next socket connects; 'fail' = next socket
   // errors (a dead remote). Mirrors a VPS going away after the first connect.
   static mode: 'open' | 'fail' = 'open'
+  static sequence: Array<'open' | 'fail'> = []
   static instances: FakeWebSocket[] = []
 
   readyState = 0
@@ -34,7 +35,7 @@ class FakeWebSocket {
 
   constructor(public url: string) {
     FakeWebSocket.instances.push(this)
-    const willOpen = FakeWebSocket.mode === 'open'
+    const willOpen = (FakeWebSocket.sequence.shift() ?? FakeWebSocket.mode) === 'open'
     // Resolve on the next microtask/macrotask so connect()'s promise wiring is
     // in place before open/error fires (matches real async socket handshake).
     setTimeout(() => {
@@ -104,13 +105,19 @@ function fakeDesktop() {
   }
 }
 
-function Harness() {
+function Harness({
+  refreshHermesConfig = async () => undefined,
+  refreshSessions = async () => undefined
+}: {
+  refreshHermesConfig?: () => Promise<void>
+  refreshSessions?: () => Promise<void>
+}) {
   useGatewayBoot({
     handleGatewayEvent: () => undefined,
     onConnectionReady: () => undefined,
     onGatewayReady: () => undefined,
-    refreshHermesConfig: async () => undefined,
-    refreshSessions: async () => undefined
+    refreshHermesConfig,
+    refreshSessions
   })
 
   return null
@@ -121,6 +128,7 @@ const originalWebSocket = globalThis.WebSocket
 beforeEach(() => {
   vi.useFakeTimers()
   FakeWebSocket.mode = 'open'
+  FakeWebSocket.sequence = []
   FakeWebSocket.instances = []
   ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
   ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
@@ -147,6 +155,9 @@ afterEach(() => {
 // Let pending microtasks (awaits) AND the queued 0ms socket open/error fire.
 async function flushAsync() {
   await act(async () => {
+    await Promise.resolve()
+    await vi.advanceTimersByTimeAsync(0)
+    await Promise.resolve()
     await vi.advanceTimersByTimeAsync(0)
   })
 }
@@ -161,6 +172,185 @@ async function advanceBackoff() {
 }
 
 describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => {
+  it('FIX: initial boot retries a transient remote OAuth getConnection auth miss', async () => {
+    const desktop = {
+      ...fakeDesktop(),
+      getConnection: vi
+        .fn()
+        .mockRejectedValueOnce(
+          new Error('Your remote gateway session has expired. Open Settings → Gateway and click "Sign in" again.')
+        )
+        .mockResolvedValueOnce({
+          authMode: 'oauth' as const,
+          baseUrl: 'https://vps.example.com',
+          profile: 'default',
+          wsUrl: 'wss://vps.example.com/api/ws?ticket=stale'
+        })
+    }
+    desktop.getGatewayWsUrl = vi.fn(async () => 'wss://vps.example.com/api/ws?ticket=fresh')
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    await flushAsync()
+    await flushAsync()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1)
+    })
+
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().error).toBeNull()
+    expect(desktop.getConnection).toHaveBeenCalledTimes(2)
+  })
+
+  it('FIX: initial boot keeps retrying remote OAuth auth misses long enough for refresh', async () => {
+    const authMiss = 'Your remote gateway session has expired. Open Settings → Gateway and click "Sign in" again.'
+    const getConnection = vi.fn()
+
+    for (let i = 0; i < 6; i += 1) {
+      getConnection.mockRejectedValueOnce(new Error(authMiss))
+    }
+
+    getConnection.mockResolvedValueOnce({
+      authMode: 'oauth' as const,
+      baseUrl: 'https://vps.example.com',
+      profile: 'default',
+      wsUrl: 'wss://vps.example.com/api/ws?ticket=stale'
+    })
+
+    const desktop = {
+      ...fakeDesktop(),
+      getConnection
+    }
+    desktop.getGatewayWsUrl = vi.fn(async () => 'wss://vps.example.com/api/ws?ticket=fresh')
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    for (const delay of [1_000, 2_000, 4_000, 8_000, 15_000, 15_000]) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(delay)
+      })
+      await flushAsync()
+    }
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1)
+    })
+
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().error).toBeNull()
+    expect(desktop.getConnection).toHaveBeenCalledTimes(7)
+  })
+
+  it('FIX: initial boot retries a failed gateway handshake with a fresh WS URL', async () => {
+    FakeWebSocket.sequence = ['fail', 'open']
+    const desktop = {
+      ...fakeDesktop(),
+      getConnection: vi.fn(async () => ({
+        authMode: 'oauth' as const,
+        baseUrl: 'https://vps.example.com',
+        profile: 'default',
+        wsUrl: 'wss://vps.example.com/api/ws?ticket=stale'
+      }))
+    }
+    let ticket = 0
+    desktop.getGatewayWsUrl = vi.fn(async () => `wss://vps.example.com/api/ws?ticket=fresh-${++ticket}`)
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    await flushAsync()
+    await flushAsync()
+    await flushAsync()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1)
+    })
+
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().error).toBeNull()
+    expect(desktop.getGatewayWsUrl).toHaveBeenCalledTimes(2)
+    expect(FakeWebSocket.instances.map(socket => socket.url)).toEqual([
+      'wss://vps.example.com/api/ws?ticket=fresh-1',
+      'wss://vps.example.com/api/ws?ticket=fresh-2'
+    ])
+  })
+
+  it('FIX: initial boot retries transient session refresh timeouts before failing', async () => {
+    const refreshSessions = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Timed out connecting to Hermes backend after 60000ms'))
+      .mockResolvedValueOnce(undefined)
+
+    render(<Harness refreshSessions={refreshSessions} />)
+    await flushAsync()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    await flushAsync()
+
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().error).toBeNull()
+    expect(refreshSessions).toHaveBeenCalledTimes(2)
+  })
+
+  it('FIX: retryable initial boot failures keep retrying and clear once auth recovers', async () => {
+    const authMiss = 'Your remote gateway session has expired. Open Settings → Gateway and click "Sign in" again.'
+    const getConnection = vi.fn()
+
+    for (let i = 0; i < 10; i += 1) {
+      getConnection.mockRejectedValueOnce(new Error(authMiss))
+    }
+
+    getConnection.mockResolvedValueOnce({
+      authMode: 'oauth' as const,
+      baseUrl: 'https://vps.example.com',
+      profile: 'default',
+      wsUrl: 'wss://vps.example.com/api/ws?ticket=stale'
+    })
+
+    const desktop = {
+      ...fakeDesktop(),
+      getConnection
+    }
+    desktop.getGatewayWsUrl = vi.fn(async () => 'wss://vps.example.com/api/ws?ticket=fresh')
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    for (const delay of [1_000, 2_000, 4_000, 8_000, 15_000, 15_000, 15_000, 15_000, 15_000]) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(delay)
+      })
+      await flushAsync()
+    }
+
+    expect($desktopBoot.get().error).toContain('session has expired')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000)
+    })
+    await flushAsync()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1)
+    })
+
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().error).toBeNull()
+    expect(desktop.getConnection).toHaveBeenCalledTimes(11)
+  })
+
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {
     // The report's actual path: a fresh launch pointed at an unreachable VPS.
     // startHermes()'s remote branch awaits waitForHermes() for 45s before it

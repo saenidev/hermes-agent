@@ -1027,6 +1027,17 @@ class TestFindAliasForProfile:
         (wrapper_dir / "pip").write_text("#!/bin/sh\nexec python -m pip \"$@\"\n")
         assert find_alias_for_profile("steve") is None
 
+    def test_ignores_oversized_unrelated_files(self, profile_env, monkeypatch):
+        # Some tools install extensionless binaries/scripts in ~/.local/bin.
+        # Alias lookup must not read/decode large files on every dashboard
+        # profile refresh.
+        monkeypatch.setattr("sys.platform", "darwin")
+        from hermes_cli.profiles import _get_wrapper_dir, find_alias_for_profile
+        wrapper_dir = _get_wrapper_dir()
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
+        (wrapper_dir / "large-tool").write_bytes(b"\xff" * (32 * 1024) + b"hermes -p steve")
+        assert find_alias_for_profile("steve") is None
+
     def test_custom_alias_on_windows(self, profile_env, monkeypatch):
         monkeypatch.setattr("sys.platform", "win32")
         from hermes_cli.profiles import create_wrapper_script, find_alias_for_profile
@@ -1047,6 +1058,28 @@ class TestFindAliasForProfile:
         assert info.alias_name == "qiaobusi"
         assert info.alias_path is not None
         assert info.alias_path.name == "qiaobusi"
+
+    def test_list_profiles_builds_alias_map_once(self, profile_env, monkeypatch):
+        monkeypatch.setattr("sys.platform", "darwin")
+        from hermes_cli import profiles as profiles_mod
+
+        profiles_mod.create_profile("alpha", no_alias=True)
+        profiles_mod.create_profile("beta", no_alias=True)
+
+        calls = 0
+
+        def fake_alias_map(_wrapper_dir=None):
+            nonlocal calls
+            calls += 1
+            return {"alpha": "a"}
+
+        monkeypatch.setattr(profiles_mod, "_build_profile_alias_map", fake_alias_map)
+
+        rows = {profile.name: profile for profile in profiles_mod.list_profiles()}
+
+        assert calls == 1
+        assert rows["alpha"].alias_name == "a"
+        assert rows["beta"].alias_name is None
 
 
 # ===================================================================

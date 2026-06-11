@@ -35,6 +35,8 @@ from typing import List, Optional, Tuple
 from agent.skill_utils import is_excluded_skill_path
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_WRAPPER_PROFILE_REF_RE = re.compile(r"(?:^|\s)hermes\s+-p\s+([a-z0-9][a-z0-9_-]{0,63})(?:\s|$)")
+_MAX_WRAPPER_SCAN_BYTES = 16 * 1024
 
 # Directories bootstrapped inside every new profile
 _PROFILE_DIRS = [
@@ -575,12 +577,24 @@ def build_alias_map() -> dict[str, str]:
     wrapper, matching ``find_alias_for_profile``'s preference; deterministic via
     sorted iteration.
     """
-    wrapper_dir = _get_wrapper_dir()
-    result: dict[str, str] = {}
+    return _build_profile_alias_map()
+
+
+def _build_profile_alias_map(wrapper_dir: Optional[Path] = None) -> dict[str, str]:
+    """Return ``{profile_name: alias_name}`` for Hermes wrapper scripts.
+
+    ``~/.local/bin`` commonly contains unrelated binaries and tool shims. The
+    dashboard calls ``list_profiles()`` often, so this scan is deliberately
+    bounded: only plausible wrapper file names are considered, oversized files
+    are ignored, and bytes are checked for the Hermes marker before decoding.
+    """
+    wrapper_dir = wrapper_dir or _get_wrapper_dir()
     if not wrapper_dir.is_dir():
-        return result
+        return {}
+
     is_windows = sys.platform == "win32"
-    prefix = "hermes -p "
+    custom_aliases: dict[str, str] = {}
+    profile_named_aliases: dict[str, str] = {}
 
     for entry in sorted(wrapper_dir.iterdir()):
         if not entry.is_file():
@@ -591,28 +605,29 @@ def build_alias_map() -> dict[str, str]:
         if not is_windows and entry.suffix:
             continue
         try:
-            with open(entry, "r", encoding="utf-8", errors="strict") as f:
-                content = f.read(_WRAPPER_READ_LIMIT)
-        except (OSError, UnicodeDecodeError):
-            # UnicodeDecodeError = a binary on PATH (ffmpeg etc.) — not a wrapper.
+            if entry.stat().st_size > _MAX_WRAPPER_SCAN_BYTES:
+                continue
+            raw = entry.read_bytes()
+        except OSError:
             continue
-        idx = content.find(prefix)
-        if idx == -1:
+        if b"hermes -p " not in raw:
             continue
-        rest = content[idx + len(prefix):]
-        # Profile id is the first whitespace-delimited token after the flag.
-        canon = rest.split(None, 1)[0].strip() if rest.strip() else ""
-        if not canon:
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
             continue
-        canon = normalize_profile_name(canon)
+
         alias = entry.stem if is_windows else entry.name
-        # Custom alias (name != profile) preferred; otherwise keep the
-        # profile-named wrapper. Don't overwrite a custom alias already found.
-        if alias == canon:
-            result.setdefault(canon, alias)
-        else:
-            result[canon] = alias
-    return result
+        for match in _WRAPPER_PROFILE_REF_RE.finditer(content):
+            profile = normalize_profile_name(match.group(1))
+            if alias == profile:
+                profile_named_aliases.setdefault(profile, alias)
+            else:
+                custom_aliases.setdefault(profile, alias)
+
+    aliases = dict(profile_named_aliases)
+    aliases.update(custom_aliases)
+    return aliases
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +893,7 @@ def list_profiles() -> List[ProfileInfo]:
     """Return info for all profiles, including the default."""
     profiles = []
     wrapper_dir = _get_wrapper_dir()
+    alias_map = _build_profile_alias_map(wrapper_dir)
 
     # Default profile
     default_home = _get_default_hermes_home()
@@ -917,7 +933,7 @@ def list_profiles() -> List[ProfileInfo]:
             if not _PROFILE_ID_RE.match(name):
                 continue
             model, provider = _read_config_model(entry)
-            alias_name = alias_map.get(normalize_profile_name(name))
+            alias_name = alias_map.get(name)
             if alias_name:
                 is_windows = sys.platform == "win32"
                 alias_path = wrapper_dir / (f"{alias_name}.bat" if is_windows else alias_name)

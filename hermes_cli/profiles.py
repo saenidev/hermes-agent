@@ -35,7 +35,9 @@ from typing import List, Optional, Tuple
 from agent.skill_utils import is_excluded_skill_path
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-_WRAPPER_PROFILE_REF_RE = re.compile(r"(?:^|\s)hermes\s+-p\s+([a-z0-9][a-z0-9_-]{0,63})(?:\s|$)")
+_WRAPPER_PROFILE_REF_RE = re.compile(
+    r"(?:^|\s)(?:'[^']*/hermes'|\"[^\"]*/hermes\"|(?:\S*/)?hermes)\s+-p\s+([a-z0-9][a-z0-9_-]{0,63})(?:\s|$)"
+)
 _MAX_WRAPPER_SCAN_BYTES = 16 * 1024
 
 # Directories bootstrapped inside every new profile
@@ -610,7 +612,7 @@ def _build_profile_alias_map(wrapper_dir: Optional[Path] = None) -> dict[str, st
             raw = entry.read_bytes()
         except OSError:
             continue
-        if b"hermes -p " not in raw:
+        if b"hermes" not in raw or b" -p " not in raw:
             continue
         try:
             content = raw.decode("utf-8")

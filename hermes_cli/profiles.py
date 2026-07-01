@@ -922,10 +922,6 @@ def list_profiles() -> List[ProfileInfo]:
     # Named profiles
     profiles_root = _get_profiles_root()
     if profiles_root.is_dir():
-        # Build the {profile -> alias} map ONCE here instead of calling
-        # find_alias_for_profile() per profile (which re-scanned the whole
-        # wrapper dir each time — O(N*M), the dominant cost in this function).
-        alias_map = build_alias_map()
         for entry in sorted(profiles_root.iterdir()):
             if not entry.is_dir():
                 continue

@@ -414,6 +414,7 @@ const BOOT_FAKE_STEP_MS = (() => {
   return Math.max(120, raw)
 })()
 const APP_NAME = 'Hermes'
+const MAC_BUNDLE_ID = 'com.nousresearch.hermes'
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
 const WINDOW_BUTTON_POSITION = {
@@ -5823,6 +5824,21 @@ function focusWindow(win, options = {}) {
   }
 }
 
+function requestMacApplicationActivation() {
+  if (!IS_MAC) return
+  const target = IS_PACKAGED ? `id "${MAC_BUNDLE_ID}"` : `"${APP_NAME}"`
+  try {
+    const child = spawn(
+      '/usr/bin/osascript',
+      ['-e', `tell application ${target} to activate`],
+      hiddenWindowsChildOptions({ stdio: 'ignore' })
+    )
+    child.unref?.()
+  } catch {
+    // Activation is best-effort; focusWindow still does the native Electron path.
+  }
+}
+
 function spawnSecondaryWindow({ sessionId, watch, newSession } = {}) {
   const icon = getAppIconPath()
   const win = new BrowserWindow({
@@ -6076,7 +6092,14 @@ function createWindow() {
   let startupRevealScheduled = false
   const revealMainWindowOnStartup = () => {
     if (!mainWindow || mainWindow.isDestroyed()) return
+    requestMacApplicationActivation()
     focusWindow(mainWindow, { restoreDelayMs: 1800 })
+    if (IS_MAC) {
+      setTimeout(() => {
+        if (!mainWindow || mainWindow.isDestroyed()) return
+        focusWindow(mainWindow, { restoreDelayMs: 1800 })
+      }, 220)
+    }
     if (startupRevealScheduled) return
     startupRevealScheduled = true
     for (const delayMs of [600, 1600, 3200]) {

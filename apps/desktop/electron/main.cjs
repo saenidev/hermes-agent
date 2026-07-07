@@ -6073,7 +6073,7 @@ function createWindow() {
   if (savedWindowState?.isMaximized) mainWindow.maximize()
 
   mainWindow.once('ready-to-show', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show()
+    if (mainWindow && !mainWindow.isDestroyed()) focusWindow(mainWindow)
   })
 
   mainWindow.on('will-enter-full-screen', () => sendWindowStateChanged(true))
@@ -6141,13 +6141,10 @@ function createWindow() {
     rememberLog(`[renderer console] ${text} (${src}:${lineNo})`)
   })
 
-  if (DEV_SERVER) {
-    mainWindow.loadURL(DEV_SERVER)
-  } else {
-    mainWindow.loadURL(pathToFileURL(resolveRendererIndex()).toString())
-  }
-
-  mainWindow.webContents.once('did-finish-load', () => {
+  let firstLoadHandled = false
+  const handleFirstLoad = () => {
+    if (firstLoadHandled) return
+    firstLoadHandled = true
     // ready-to-show is normally responsible for revealing the window, but some
     // macOS/Electron launches can finish loading with the renderer alive while
     // the native window remains hidden. Do a second reveal after first paint so
@@ -6157,7 +6154,16 @@ function createWindow() {
     broadcastBootProgress()
     sendWindowStateChanged()
     startHermes().catch(error => rememberLog(error.stack || error.message))
+  }
+  mainWindow.webContents.once('did-finish-load', () => {
+    handleFirstLoad()
   })
+
+  if (DEV_SERVER) {
+    mainWindow.loadURL(DEV_SERVER)
+  } else {
+    mainWindow.loadURL(pathToFileURL(resolveRendererIndex()).toString())
+  }
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))

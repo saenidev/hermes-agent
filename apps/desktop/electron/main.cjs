@@ -5761,6 +5761,25 @@ const sessionWindows = createSessionWindowRegistry()
 function focusWindow(win) {
   if (!win || win.isDestroyed()) return
   if (win.isMinimized()) win.restore()
+
+  let restoreWorkspaceVisibility = false
+  let restoreAlwaysOnTop = false
+
+  if (IS_MAC) {
+    try {
+      win.setVisibleOnAllWorkspaces?.(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
+      restoreWorkspaceVisibility = true
+    } catch {
+      // Some Electron/macOS combinations reject workspace transforms.
+    }
+    try {
+      win.setAlwaysOnTop(true, 'screen-saver')
+      restoreAlwaysOnTop = true
+    } catch {
+      // Best effort; focus/show must stay robust across Electron versions.
+    }
+  }
+
   win.show()
   try {
     win.moveTop?.()
@@ -5769,6 +5788,7 @@ function focusWindow(win) {
   }
   if (IS_MAC) {
     try {
+      app.show?.()
       app.focus({ steal: true })
     } catch {
       // Older Electron builds may not support options here.
@@ -5780,6 +5800,26 @@ function focusWindow(win) {
     }
   }
   win.focus()
+
+  if (restoreWorkspaceVisibility || restoreAlwaysOnTop) {
+    setTimeout(() => {
+      if (!win || win.isDestroyed()) return
+      if (restoreAlwaysOnTop) {
+        try {
+          win.setAlwaysOnTop(false)
+        } catch {
+          // Window may have been torn down.
+        }
+      }
+      if (restoreWorkspaceVisibility) {
+        try {
+          win.setVisibleOnAllWorkspaces?.(false, { skipTransformProcessType: true })
+        } catch {
+          // Window may have been torn down.
+        }
+      }
+    }, 750)
+  }
 }
 
 function spawnSecondaryWindow({ sessionId, watch, newSession } = {}) {

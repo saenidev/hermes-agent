@@ -5761,7 +5761,24 @@ const sessionWindows = createSessionWindowRegistry()
 function focusWindow(win) {
   if (!win || win.isDestroyed()) return
   if (win.isMinimized()) win.restore()
-  if (!win.isVisible()) win.show()
+  win.show()
+  try {
+    win.moveTop?.()
+  } catch {
+    // Best effort; focus/show must stay robust across Electron versions.
+  }
+  if (IS_MAC) {
+    try {
+      app.focus({ steal: true })
+    } catch {
+      // Older Electron builds may not support options here.
+      try {
+        app.focus()
+      } catch {
+        // Ignore; BrowserWindow.focus below is the real fallback.
+      }
+    }
+  }
   win.focus()
 }
 
@@ -6091,6 +6108,11 @@ function createWindow() {
   }
 
   mainWindow.webContents.once('did-finish-load', () => {
+    // ready-to-show is normally responsible for revealing the window, but some
+    // macOS/Electron launches can finish loading with the renderer alive while
+    // the native window remains hidden. Do a second reveal after first paint so
+    // a loaded desktop cannot sit invisibly in the Dock.
+    focusWindow(mainWindow)
     restorePersistedZoomLevel(mainWindow)
     broadcastBootProgress()
     sendWindowStateChanged()

@@ -5758,9 +5758,10 @@ function wireCommonWindowHandlers(win) {
 // builder live in session-windows.cjs so they stay unit-testable.
 const sessionWindows = createSessionWindowRegistry()
 
-function focusWindow(win) {
+function focusWindow(win, options = {}) {
   if (!win || win.isDestroyed()) return
   if (win.isMinimized()) win.restore()
+  const restoreDelayMs = Math.max(750, Number(options.restoreDelayMs) || 1500)
 
   let restoreWorkspaceVisibility = false
   let restoreAlwaysOnTop = false
@@ -5818,7 +5819,7 @@ function focusWindow(win) {
           // Window may have been torn down.
         }
       }
-    }, 750)
+    }, restoreDelayMs)
   }
 }
 
@@ -6072,8 +6073,24 @@ function createWindow() {
 
   if (savedWindowState?.isMaximized) mainWindow.maximize()
 
+  let startupRevealScheduled = false
+  const revealMainWindowOnStartup = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    focusWindow(mainWindow, { restoreDelayMs: 1800 })
+    if (startupRevealScheduled) return
+    startupRevealScheduled = true
+    for (const delayMs of [600, 1600, 3200]) {
+      setTimeout(() => {
+        if (!mainWindow || mainWindow.isDestroyed()) return
+        if (!mainWindow.isVisible() || !mainWindow.isFocused()) {
+          focusWindow(mainWindow, { restoreDelayMs: 1800 })
+        }
+      }, delayMs)
+    }
+  }
+
   mainWindow.once('ready-to-show', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) focusWindow(mainWindow)
+    revealMainWindowOnStartup()
   })
 
   mainWindow.on('will-enter-full-screen', () => sendWindowStateChanged(true))
@@ -6149,7 +6166,7 @@ function createWindow() {
     // macOS/Electron launches can finish loading with the renderer alive while
     // the native window remains hidden. Do a second reveal after first paint so
     // a loaded desktop cannot sit invisibly in the Dock.
-    focusWindow(mainWindow)
+    revealMainWindowOnStartup()
     restorePersistedZoomLevel(mainWindow)
     broadcastBootProgress()
     sendWindowStateChanged()

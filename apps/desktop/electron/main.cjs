@@ -414,6 +414,7 @@ const BOOT_FAKE_STEP_MS = (() => {
   return Math.max(120, raw)
 })()
 const APP_NAME = 'Hermes'
+const MAC_BUNDLE_ID = 'com.nousresearch.hermes'
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
 const WINDOW_BUTTON_POSITION = {
@@ -5758,25 +5759,40 @@ function wireCommonWindowHandlers(win) {
 // builder live in session-windows.cjs so they stay unit-testable.
 const sessionWindows = createSessionWindowRegistry()
 
-function focusWindow(win) {
+function focusWindow(win, options = {}) {
   if (!win || win.isDestroyed()) return
   if (win.isMinimized()) win.restore()
+  const restoreDelayMs = Math.max(750, Number(options.restoreDelayMs) || 1500)
 
   let restoreWorkspaceVisibility = false
   let restoreAlwaysOnTop = false
 
   if (IS_MAC) {
+    const useWorkspaceVisibility = options.useWorkspaceVisibility !== false
+    const restoreWorkspaceAfterFocus = options.restoreWorkspaceVisibility !== false
+    const restoreAlwaysOnTopAfterFocus = options.restoreAlwaysOnTop !== false
+    const alwaysOnTopLevel = options.alwaysOnTopLevel || 'screen-saver'
     try {
-      win.setVisibleOnAllWorkspaces?.(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
-      restoreWorkspaceVisibility = true
+      if (useWorkspaceVisibility) {
+        win.setVisibleOnAllWorkspaces?.(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
+        restoreWorkspaceVisibility = restoreWorkspaceAfterFocus
+      }
     } catch {
       // Some Electron/macOS combinations reject workspace transforms.
     }
     try {
-      win.setAlwaysOnTop(true, 'screen-saver')
-      restoreAlwaysOnTop = true
+      win.setAlwaysOnTop(true, alwaysOnTopLevel)
+      restoreAlwaysOnTop = restoreAlwaysOnTopAfterFocus
     } catch {
       // Best effort; focus/show must stay robust across Electron versions.
+    }
+    try {
+      const bounds = win.getBounds()
+      if (bounds && bounds.width > 0 && bounds.height > 0) {
+        win.setBounds(bounds)
+      }
+    } catch {
+      // Best effort; nudging bounds can force macOS to materialize a hidden NSWindow.
     }
   }
 
@@ -5818,7 +5834,22 @@ function focusWindow(win) {
           // Window may have been torn down.
         }
       }
-    }, 750)
+    }, restoreDelayMs)
+  }
+}
+
+function requestMacApplicationActivation() {
+  if (!IS_MAC) return
+  const target = IS_PACKAGED ? `id "${MAC_BUNDLE_ID}"` : `"${APP_NAME}"`
+  try {
+    const child = spawn(
+      '/usr/bin/osascript',
+      ['-e', `tell application ${target} to activate`],
+      hiddenWindowsChildOptions({ stdio: 'ignore' })
+    )
+    child.unref?.()
+  } catch {
+    // Activation is best-effort; focusWindow still does the native Electron path.
   }
 }
 
@@ -6072,9 +6103,68 @@ function createWindow() {
 
   if (savedWindowState?.isMaximized) mainWindow.maximize()
 
+  let startupRevealScheduled = false
+  const revealMainWindowOnStartup = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    requestMacApplicationActivation()
+    focusWindow(mainWindow, {
+      alwaysOnTopLevel: 'floating',
+      restoreDelayMs: 1800,
+      restoreAlwaysOnTop: false,
+      restoreWorkspaceVisibility: false
+    })
+    if (IS_MAC) {
+      setTimeout(() => {
+        if (!mainWindow || mainWindow.isDestroyed()) return
+        requestMacApplicationActivation()
+        focusWindow(mainWindow, {
+          alwaysOnTopLevel: 'floating',
+          restoreDelayMs: 1800,
+          restoreAlwaysOnTop: false,
+          restoreWorkspaceVisibility: false
+        })
+      }, 220)
+    }
+    if (startupRevealScheduled) return
+    startupRevealScheduled = true
+    for (const delayMs of [600, 1600, 3200, 7000, 11000]) {
+      setTimeout(() => {
+        if (!mainWindow || mainWindow.isDestroyed()) return
+        requestMacApplicationActivation()
+        focusWindow(mainWindow, {
+          alwaysOnTopLevel: 'floating',
+          restoreDelayMs: 1800,
+          restoreAlwaysOnTop: false,
+          restoreWorkspaceVisibility: false
+        })
+      }, delayMs)
+    }
+  }
+
   mainWindow.once('ready-to-show', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show()
+    revealMainWindowOnStartup()
   })
+
+  if (IS_MAC) {
+    const keepMainWindowMaterialized = () => {
+      if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized() || !mainWindow.isVisible()) return
+      try {
+        mainWindow.setVisibleOnAllWorkspaces?.(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
+      } catch {
+        // Some Electron/macOS combinations reject workspace transforms.
+      }
+    }
+    mainWindow.on('blur', () => {
+      try {
+        mainWindow.setAlwaysOnTop(false)
+      } catch {
+        // Window may be closing.
+      }
+      keepMainWindowMaterialized()
+    })
+    const materializeTimer = setInterval(keepMainWindowMaterialized, 10000)
+    mainWindow.on('closed', () => clearInterval(materializeTimer))
+  }
 
   mainWindow.on('will-enter-full-screen', () => sendWindowStateChanged(true))
   mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
@@ -6141,23 +6231,29 @@ function createWindow() {
     rememberLog(`[renderer console] ${text} (${src}:${lineNo})`)
   })
 
+  let firstLoadHandled = false
+  const handleFirstLoad = () => {
+    if (firstLoadHandled) return
+    firstLoadHandled = true
+    // ready-to-show is normally responsible for revealing the window, but some
+    // macOS/Electron launches can finish loading with the renderer alive while
+    // the native window remains hidden. Do a second reveal after first paint so
+    // a loaded desktop cannot sit invisibly in the Dock.
+    revealMainWindowOnStartup()
+    restorePersistedZoomLevel(mainWindow)
+    broadcastBootProgress()
+    sendWindowStateChanged()
+    startHermes().catch(error => rememberLog(error.stack || error.message))
+  }
+  mainWindow.webContents.once('did-finish-load', () => {
+    handleFirstLoad()
+  })
+
   if (DEV_SERVER) {
     mainWindow.loadURL(DEV_SERVER)
   } else {
     mainWindow.loadURL(pathToFileURL(resolveRendererIndex()).toString())
   }
-
-  mainWindow.webContents.once('did-finish-load', () => {
-    // ready-to-show is normally responsible for revealing the window, but some
-    // macOS/Electron launches can finish loading with the renderer alive while
-    // the native window remains hidden. Do a second reveal after first paint so
-    // a loaded desktop cannot sit invisibly in the Dock.
-    focusWindow(mainWindow)
-    restorePersistedZoomLevel(mainWindow)
-    broadcastBootProgress()
-    sendWindowStateChanged()
-    startHermes().catch(error => rememberLog(error.stack || error.message))
-  })
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))

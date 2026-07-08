@@ -6090,13 +6090,19 @@ function createWindow() {
   if (savedWindowState?.isMaximized) mainWindow.maximize()
 
   let startupRevealScheduled = false
+  let startupRevealSatisfied = false
+  mainWindow.once('focus', () => {
+    startupRevealSatisfied = true
+  })
   const revealMainWindowOnStartup = () => {
     if (!mainWindow || mainWindow.isDestroyed()) return
+    if (startupRevealSatisfied) return
     requestMacApplicationActivation()
     focusWindow(mainWindow, { restoreDelayMs: 1800 })
     if (IS_MAC) {
       setTimeout(() => {
         if (!mainWindow || mainWindow.isDestroyed()) return
+        if (startupRevealSatisfied) return
         focusWindow(mainWindow, { restoreDelayMs: 1800 })
       }, 220)
     }
@@ -6105,6 +6111,7 @@ function createWindow() {
     for (const delayMs of [600, 1600, 3200, 7000, 11000]) {
       setTimeout(() => {
         if (!mainWindow || mainWindow.isDestroyed()) return
+        if (startupRevealSatisfied) return
         requestMacApplicationActivation()
         focusWindow(mainWindow, { restoreDelayMs: 1800 })
       }, delayMs)

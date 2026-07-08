@@ -5780,6 +5780,14 @@ function focusWindow(win, options = {}) {
     } catch {
       // Best effort; focus/show must stay robust across Electron versions.
     }
+    try {
+      const bounds = win.getBounds()
+      if (bounds && bounds.width > 0 && bounds.height > 0) {
+        win.setBounds(bounds)
+      }
+    } catch {
+      // Best effort; nudging bounds can force macOS to materialize a hidden NSWindow.
+    }
   }
 
   win.show()
@@ -6090,19 +6098,14 @@ function createWindow() {
   if (savedWindowState?.isMaximized) mainWindow.maximize()
 
   let startupRevealScheduled = false
-  let startupRevealSatisfied = false
-  mainWindow.once('focus', () => {
-    startupRevealSatisfied = true
-  })
   const revealMainWindowOnStartup = () => {
     if (!mainWindow || mainWindow.isDestroyed()) return
-    if (startupRevealSatisfied) return
     requestMacApplicationActivation()
     focusWindow(mainWindow, { restoreDelayMs: 1800 })
     if (IS_MAC) {
       setTimeout(() => {
         if (!mainWindow || mainWindow.isDestroyed()) return
-        if (startupRevealSatisfied) return
+        requestMacApplicationActivation()
         focusWindow(mainWindow, { restoreDelayMs: 1800 })
       }, 220)
     }
@@ -6111,7 +6114,6 @@ function createWindow() {
     for (const delayMs of [600, 1600, 3200, 7000, 11000]) {
       setTimeout(() => {
         if (!mainWindow || mainWindow.isDestroyed()) return
-        if (startupRevealSatisfied) return
         requestMacApplicationActivation()
         focusWindow(mainWindow, { restoreDelayMs: 1800 })
       }, delayMs)

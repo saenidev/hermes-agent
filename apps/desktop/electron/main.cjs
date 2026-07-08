@@ -5769,10 +5769,11 @@ function focusWindow(win, options = {}) {
 
   if (IS_MAC) {
     const useWorkspaceVisibility = options.useWorkspaceVisibility !== false
+    const restoreWorkspaceAfterFocus = options.restoreWorkspaceVisibility !== false
     try {
       if (useWorkspaceVisibility) {
         win.setVisibleOnAllWorkspaces?.(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
-        restoreWorkspaceVisibility = true
+        restoreWorkspaceVisibility = restoreWorkspaceAfterFocus
       }
     } catch {
       // Some Electron/macOS combinations reject workspace transforms.
@@ -6104,12 +6105,12 @@ function createWindow() {
   const revealMainWindowOnStartup = () => {
     if (!mainWindow || mainWindow.isDestroyed()) return
     requestMacApplicationActivation()
-    focusWindow(mainWindow, { restoreDelayMs: 1800, useWorkspaceVisibility: false })
+    focusWindow(mainWindow, { restoreDelayMs: 1800, restoreWorkspaceVisibility: false })
     if (IS_MAC) {
       setTimeout(() => {
         if (!mainWindow || mainWindow.isDestroyed()) return
         requestMacApplicationActivation()
-        focusWindow(mainWindow, { restoreDelayMs: 1800, useWorkspaceVisibility: false })
+        focusWindow(mainWindow, { restoreDelayMs: 1800, restoreWorkspaceVisibility: false })
       }, 220)
     }
     if (startupRevealScheduled) return
@@ -6118,7 +6119,7 @@ function createWindow() {
       setTimeout(() => {
         if (!mainWindow || mainWindow.isDestroyed()) return
         requestMacApplicationActivation()
-        focusWindow(mainWindow, { restoreDelayMs: 1800, useWorkspaceVisibility: false })
+        focusWindow(mainWindow, { restoreDelayMs: 1800, restoreWorkspaceVisibility: false })
       }, delayMs)
     }
   }

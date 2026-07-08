@@ -6146,13 +6146,24 @@ function createWindow() {
   })
 
   if (IS_MAC) {
+    const keepMainWindowMaterialized = () => {
+      if (!mainWindow || mainWindow.isDestroyed() || mainWindow.isMinimized() || !mainWindow.isVisible()) return
+      try {
+        mainWindow.setVisibleOnAllWorkspaces?.(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
+      } catch {
+        // Some Electron/macOS combinations reject workspace transforms.
+      }
+    }
     mainWindow.on('blur', () => {
       try {
         mainWindow.setAlwaysOnTop(false)
       } catch {
         // Window may be closing.
       }
+      keepMainWindowMaterialized()
     })
+    const materializeTimer = setInterval(keepMainWindowMaterialized, 10000)
+    mainWindow.on('closed', () => clearInterval(materializeTimer))
   }
 
   mainWindow.on('will-enter-full-screen', () => sendWindowStateChanged(true))

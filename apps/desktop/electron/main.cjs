@@ -6102,12 +6102,11 @@ function createWindow() {
     }
     if (startupRevealScheduled) return
     startupRevealScheduled = true
-    for (const delayMs of [600, 1600, 3200]) {
+    for (const delayMs of [600, 1600, 3200, 7000, 11000]) {
       setTimeout(() => {
         if (!mainWindow || mainWindow.isDestroyed()) return
-        if (!mainWindow.isVisible() || !mainWindow.isFocused()) {
-          focusWindow(mainWindow, { restoreDelayMs: 1800 })
-        }
+        requestMacApplicationActivation()
+        focusWindow(mainWindow, { restoreDelayMs: 1800 })
       }, delayMs)
     }
   }

@@ -6152,11 +6152,6 @@ function createWindow() {
       } catch {
         // Window may be closing.
       }
-      try {
-        mainWindow.setVisibleOnAllWorkspaces?.(false, { skipTransformProcessType: true })
-      } catch {
-        // Window may be closing.
-      }
     })
   }
 

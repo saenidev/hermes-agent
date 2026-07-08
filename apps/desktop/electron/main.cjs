@@ -5770,6 +5770,8 @@ function focusWindow(win, options = {}) {
   if (IS_MAC) {
     const useWorkspaceVisibility = options.useWorkspaceVisibility !== false
     const restoreWorkspaceAfterFocus = options.restoreWorkspaceVisibility !== false
+    const restoreAlwaysOnTopAfterFocus = options.restoreAlwaysOnTop !== false
+    const alwaysOnTopLevel = options.alwaysOnTopLevel || 'screen-saver'
     try {
       if (useWorkspaceVisibility) {
         win.setVisibleOnAllWorkspaces?.(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
@@ -5779,8 +5781,8 @@ function focusWindow(win, options = {}) {
       // Some Electron/macOS combinations reject workspace transforms.
     }
     try {
-      win.setAlwaysOnTop(true, 'screen-saver')
-      restoreAlwaysOnTop = true
+      win.setAlwaysOnTop(true, alwaysOnTopLevel)
+      restoreAlwaysOnTop = restoreAlwaysOnTopAfterFocus
     } catch {
       // Best effort; focus/show must stay robust across Electron versions.
     }
@@ -6105,12 +6107,22 @@ function createWindow() {
   const revealMainWindowOnStartup = () => {
     if (!mainWindow || mainWindow.isDestroyed()) return
     requestMacApplicationActivation()
-    focusWindow(mainWindow, { restoreDelayMs: 1800, restoreWorkspaceVisibility: false })
+    focusWindow(mainWindow, {
+      alwaysOnTopLevel: 'floating',
+      restoreDelayMs: 1800,
+      restoreAlwaysOnTop: false,
+      restoreWorkspaceVisibility: false
+    })
     if (IS_MAC) {
       setTimeout(() => {
         if (!mainWindow || mainWindow.isDestroyed()) return
         requestMacApplicationActivation()
-        focusWindow(mainWindow, { restoreDelayMs: 1800, restoreWorkspaceVisibility: false })
+        focusWindow(mainWindow, {
+          alwaysOnTopLevel: 'floating',
+          restoreDelayMs: 1800,
+          restoreAlwaysOnTop: false,
+          restoreWorkspaceVisibility: false
+        })
       }, 220)
     }
     if (startupRevealScheduled) return
@@ -6119,7 +6131,12 @@ function createWindow() {
       setTimeout(() => {
         if (!mainWindow || mainWindow.isDestroyed()) return
         requestMacApplicationActivation()
-        focusWindow(mainWindow, { restoreDelayMs: 1800, restoreWorkspaceVisibility: false })
+        focusWindow(mainWindow, {
+          alwaysOnTopLevel: 'floating',
+          restoreDelayMs: 1800,
+          restoreAlwaysOnTop: false,
+          restoreWorkspaceVisibility: false
+        })
       }, delayMs)
     }
   }
@@ -6127,6 +6144,21 @@ function createWindow() {
   mainWindow.once('ready-to-show', () => {
     revealMainWindowOnStartup()
   })
+
+  if (IS_MAC) {
+    mainWindow.on('blur', () => {
+      try {
+        mainWindow.setAlwaysOnTop(false)
+      } catch {
+        // Window may be closing.
+      }
+      try {
+        mainWindow.setVisibleOnAllWorkspaces?.(false, { skipTransformProcessType: true })
+      } catch {
+        // Window may be closing.
+      }
+    })
+  }
 
   mainWindow.on('will-enter-full-screen', () => sendWindowStateChanged(true))
   mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))

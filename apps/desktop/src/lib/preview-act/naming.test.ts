@@ -213,8 +213,9 @@ describe('coin', () => {
   const mint = () => {
     const { coin } = identityKit(naming())
     const coined: Record<string, number> = {}
+    const reserved = new Set<string>()
 
-    return (role: string, name: string) => coin(coined, role, name)
+    return (role: string, name: string) => coin(coined, reserved, role, name)
   }
 
   it('names a handle after what the thing is and what it says', () => {

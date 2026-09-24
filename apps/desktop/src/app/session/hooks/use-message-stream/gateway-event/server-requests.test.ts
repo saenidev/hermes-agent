@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { registerPreviewScriptRunner } from '@/app/chat/right-rail/preview-script-runner'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { $rightRailActiveTabId } from '@/store/layout'
+import { closeRightRail, openPreview } from '@/store/preview'
 import { setActiveSessionId, setSessions } from '@/store/session'
 import { $sessionTiles } from '@/store/session-states'
 import { $toursEnabled } from '@/store/tours'
@@ -75,6 +78,60 @@ describe('approval request routing', () => {
 })
 
 describe('preview action request routing', () => {
+  it('honors full snapshots across repeated requests to the real preview engine', async () => {
+    document.body.innerHTML = '<button id="save">Save</button><button id="cancel">Cancel</button>'
+
+    const rect = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockReturnValue({
+      bottom: 40,
+      height: 40,
+      left: 0,
+      right: 40,
+      top: 0,
+      width: 40,
+      x: 0,
+      y: 0,
+      toJSON: () => ({})
+    })
+
+    openPreview(
+      { kind: 'url', label: 'Browser', source: 'https://example.com', url: 'https://example.com' },
+      'tool-result'
+    )
+
+    const cleanup = registerPreviewScriptRunner($rightRailActiveTabId.get()!, async code =>
+      new Function('return ' + code)()
+    )
+
+    const read = async (options: Record<string, unknown>) => {
+      const { respond } = deliver(
+        'preview.act',
+        { action: 'elements', session_id: 'session-a', ...options },
+        'session-a'
+      )
+
+      await vi.waitFor(() => expect(respond).toHaveBeenCalledOnce())
+
+      return JSON.parse(respond.mock.calls[0][0].value)
+    }
+
+    try {
+      const first = await read({ full: true })
+      expect(first.elements.map((element: { label: string }) => element.label)).toEqual(['Save', 'Cancel'])
+      expect((await read({})).delta.same).toBe(first.elements.length)
+      expect((await read({ full: false })).delta.same).toBe(first.elements.length)
+      const full = await read({ full: true })
+      expect(full.elements).toEqual(first.elements)
+      expect(full.delta).toBeUndefined()
+      expect((await read({ full: true, max: 1 })).elements).toEqual(first.elements.slice(0, 1))
+    } finally {
+      cleanup()
+      rect.mockRestore()
+      document.body.replaceChildren()
+      delete (window as unknown as { __hermesActHolder?: unknown }).__hermesActHolder
+      closeRightRail()
+    }
+  })
+
   it('retries a replayed scoped request only while no session is bound yet', () => {
     expect(previewSessionRoute({ replayed: true, sessionId: 'session-a', activeSessionId: null })).toBe('retry')
     expect(previewSessionRoute({ replayed: true, sessionId: 'session-a', activeSessionId: 'session-a' })).toBe('run')

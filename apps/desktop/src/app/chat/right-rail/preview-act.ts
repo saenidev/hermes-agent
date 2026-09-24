@@ -30,6 +30,7 @@
 import { actEngineSource, type PreviewActAction, type PreviewActResult } from '@/lib/preview-act/act-in-page'
 import { watchInPage } from '@/lib/preview-act/watch-in-page'
 
+import { beginPreviewAction } from './preview-action-flight'
 import { clickAt, glideTo, pointerPlaced, pressKey, selectAll, typeText, wheelBy } from './preview-drive'
 import { activePreviewInput, type PreviewInputHandle } from './preview-input'
 import { activePreviewNav, type PreviewNavHandle } from './preview-nav'
@@ -63,8 +64,39 @@ const CLICKS: readonly string[] = ['click', 'type']
 
 const NOTHING_OPEN = 'No live page is open in the in-app browser — open one with open_preview first.'
 
-const NAVIGATED =
-  'The page stopped answering right after — it is probably navigating. Call elements to see where you landed.'
+const READ_BEFORE_REPEAT =
+  'Do not repeat the action. Call elements for a fresh readback before deciding what to do next.'
+
+/** Missing readback is not evidence that an input either landed or did nothing. */
+function indeterminate(reason: string, before?: PreviewActResult, after?: PreviewActResult): PreviewActResult {
+  const changed = before?.url && after?.url && before.url !== after.url
+
+  return {
+    delta: after?.delta,
+    elements: after?.elements,
+    error: 'The action outcome is indeterminate. ' + reason,
+    full: after?.full,
+    note: (changed ? 'The URL changed after dispatch. ' : '') + READ_BEFORE_REPEAT,
+    success: false,
+    title: after?.title,
+    truncated: after?.truncated,
+    url: after?.url
+  }
+}
+
+function beforeInputFailure(reason: string, found?: PreviewActResult): PreviewActResult {
+  return {
+    delta: found?.delta,
+    elements: found?.elements,
+    error: 'The action stopped before any input was sent. ' + reason,
+    full: found?.full,
+    note: 'No input was sent. Call elements for a fresh readback.',
+    success: false,
+    title: found?.title,
+    truncated: found?.truncated,
+    url: found?.url
+  }
+}
 
 /** A fingerprint of the overlay's source, so the guest page can tell that the
  *  code it is running has changed underneath it.
@@ -154,8 +186,8 @@ ${preamble()}
   // viewport coordinate, so it has to be where the target ENDS UP.
   return restAfterScroll().then(function () {
     var settled = act(locate);
-    var best = settled.success ? settled : found;
-    var at = best.point;
+    if (!settled.success) { return JSON.stringify(settled); }
+    var at = settled.point;
     // Last line of defence before the pointer is sent somewhere real. An element
     // that is still outside the viewport after we scrolled to it is hidden, not
     // placed, and aiming at it would drive the cursor off into a corner and
@@ -166,7 +198,8 @@ ${preamble()}
         success: false
       });
     }
-    return JSON.stringify(best);
+    settled.viewport = { width: window.innerWidth, height: window.innerHeight };
+    return JSON.stringify(settled);
   });
 })()`
 }
@@ -246,7 +279,12 @@ ${preamble()}
       out.hit = w.__hermesHit || null;
       return JSON.stringify(out);
     } catch (err) {
-      return JSON.stringify({ note: 'The page changed before it could be re-read: ' + err, success: true });
+      return JSON.stringify({
+        error: 'The page could not be re-read: ' + err,
+        success: false,
+        title: document.title,
+        url: window.location.href
+      });
     }
   });
 })()`
@@ -274,30 +312,199 @@ ${preamble()}
       watch('sweep');
       // One or the other, never both: a re-read answers with the whole
       // inventory only when it is the first look at this page.
-      result.elements = after.elements;
-      result.delta = after.delta;
-      result.url = after.url;
-      result.title = after.title;
+      result = Object.assign({ acted: result.acted, note: result.note }, after);
+      if (!after.success) {
+        delete result.acted;
+        result.error = 'The action outcome is indeterminate. ' + (after.error || 'The page could not be re-read.');
+        result.note = ${JSON.stringify(READ_BEFORE_REPEAT)};
+      }
     } catch (err) {
-      result.note = 'The page changed before it could be re-read: ' + err;
+      result = {
+        error: 'The action outcome is indeterminate. The page could not be re-read: ' + err,
+        note: ${JSON.stringify(READ_BEFORE_REPEAT)},
+        success: false,
+        title: document.title,
+        url: window.location.href
+      };
     }
     return JSON.stringify(result);
   });
 })()`
 }
 
-/** The outcome of one round trip into the page. `silent` is its own case on
- *  purpose: a page that stops answering mid-action is navigating, whereas one
- *  that answers with nothing is broken, and the agent needs to hear the
- *  difference. */
+/** A round trip says whether the page answered, not whether an action landed. */
 type Trip = { error: string; kind: 'failed' } | { kind: 'answered'; result: PreviewActResult } | { kind: 'silent' }
 
-async function runJson(run: PreviewScriptRunner, code: string): Promise<Trip> {
+type Phase = 'inventory' | 'locate' | 'scroll' | 'annotation'
+
+const record = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+
+const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
+// CSSOM viewport/scroll dimensions are signed Web IDL longs. Reject overflow,
+// rather than letting native input or driver interpolation round/wrap it.
+const MAX_DOM_PIXELS = 2 ** 31 - 1
+
+const pixels = (value: unknown): value is number =>
+  finite(value) && Number.isInteger(value) && value >= 0 && value <= MAX_DOM_PIXELS
+
+const point = (value: unknown) => record(value) && pixels(value.x) && pixels(value.y)
+
+function viewportPoint(value: Record<string, unknown>): boolean {
+  const view = value.viewport
+  const at = value.point
+
+  // Both are guest CSS pixels. Comparing with the host renderer's viewport
+  // would reject valid zoomed-out targets: preview-input scales CSS by guest
+  // zoom only at send time. Fresh guest bounds describe that same input area.
+  return (
+    record(view) &&
+    pixels(view.width) &&
+    view.width > 0 &&
+    pixels(view.height) &&
+    view.height > 0 &&
+    record(at) &&
+    pixels(at.x) &&
+    pixels(at.y) &&
+    at.x <= view.width &&
+    at.y <= view.height
+  )
+}
+
+const optionalFields = (value: Record<string, unknown>, keys: string[], type: string) =>
+  keys.every(key => value[key] === undefined || typeof value[key] === type)
+
+function element(value: unknown, changed = false): boolean {
+  const strings = changed ? ['label', 'value', 'input_type'] : ['role', 'label', 'selector', 'value', 'input_type']
+  const booleans = ['disabled', 'editable', 'read_only']
+
+  return (
+    record(value) &&
+    reference(value.ref) &&
+    (changed || (typeof value.role === 'string' && typeof value.label === 'string')) &&
+    optionalFields(value, strings, 'string') &&
+    optionalFields(value, booleans, 'boolean') &&
+    Object.keys(value).every(key => key === 'ref' || strings.includes(key) || booleans.includes(key))
+  )
+}
+
+const reference = (value: unknown): value is string =>
+  typeof value === 'string' && value.length > 0 && value === value.trim()
+
+/** Validate literal identities, never repair them into apparently valid refs. */
+function refSet(items: unknown, members = false, changed = false): Set<string> | undefined {
+  if (!Array.isArray(items)) {
+    return undefined
+  }
+
+  const refs = new Set<string>()
+
+  for (const item of items) {
+    if (members && !element(item, changed)) {
+      return undefined
+    }
+
+    const ref: unknown = members ? item.ref : item
+
+    if (!reference(ref) || refs.has(ref)) {
+      return undefined
+    }
+
+    refs.add(ref)
+  }
+
+  return refs
+}
+
+function inventory(value: Record<string, unknown>): boolean {
+  if (typeof value.truncated !== 'boolean') {
+    return false
+  }
+
+  if (value.full === true) {
+    return value.delta === undefined && refSet(value.elements, true) !== undefined
+  }
+
+  if (value.full !== false || value.elements !== undefined || !record(value.delta)) {
+    return false
+  }
+
+  const delta = value.delta
+  const added = refSet(delta.added === undefined ? [] : delta.added, true)
+  const changed = refSet(delta.changed === undefined ? [] : delta.changed, true, true)
+  const removed = refSet(delta.removed === undefined ? [] : delta.removed)
+  const rebound = refSet(delta.rebound === undefined ? [] : delta.rebound)
+
+  if (!added || !changed || !removed || !rebound) {
+    return false
+  }
+
+  return (
+    Object.keys(delta).length > 0 &&
+    (delta.same === undefined || (Number.isSafeInteger(delta.same) && (delta.same as number) >= 0)) &&
+    [...added].every(ref => !changed.has(ref) && !removed.has(ref) && !rebound.has(ref)) &&
+    [...removed].every(ref => !changed.has(ref) && !rebound.has(ref)) &&
+    // Recreated nodes can also change mutable fields: changed + rebound is valid.
+    Object.keys(delta).every(key => ['same', 'added', 'changed', 'removed', 'rebound'].includes(key))
+  )
+}
+
+/** Transport JSON is untrusted evidence; validate the phase before forwarding it. */
+function phaseResult(value: unknown, phase: Phase): value is PreviewActResult {
+  if (
+    !record(value) ||
+    typeof value.success !== 'boolean' ||
+    !optionalFields(value, ['acted', 'error', 'note', 'title', 'url'], 'string') ||
+    !optionalFields(value, ['typable'], 'boolean')
+  ) {
+    return false
+  }
+
+  if (value.point !== undefined && !point(value.point)) {
+    return false
+  }
+
+  if (
+    value.hit !== undefined &&
+    value.hit !== null &&
+    (!record(value.hit) || typeof value.hit.tag !== 'string' || typeof value.hit.trusted !== 'boolean')
+  ) {
+    return false
+  }
+
+  const hasInventory = ['elements', 'delta', 'full', 'truncated'].some(key => value[key] !== undefined)
+
+  if (hasInventory && !inventory(value)) {
+    return false
+  }
+
+  if (!value.success) {
+    return typeof value.error === 'string' && value.error.length > 0
+  }
+
+  const valid: Record<Phase, () => boolean> = {
+    annotation: () => typeof value.acted === 'string' && value.acted.length > 0,
+    inventory: () => hasInventory,
+    locate: () => viewportPoint(value),
+    scroll: () =>
+      viewportPoint(value) &&
+      pixels(value.page) &&
+      value.page > 0 &&
+      value.page <= (value.viewport as { height: number }).height &&
+      pixels(value.span)
+  }
+
+  return valid[phase]()
+}
+
+async function runJson(run: PreviewScriptRunner, code: string, phase: Phase = 'inventory'): Promise<Trip> {
   // Pages such as Trendyol replace Promise with ZoneAwarePromise. Electron
   // awaits native promises only, otherwise IPC clones the thenable's state.
   // An async function adopts it into a native promise without changing the page.
   const raw = await Promise.race([
-    run(`(async () => (${code}))()`).catch((error: unknown) => new Error(String(error))),
+    Promise.resolve()
+      .then(() => run(`(async () => (${code}))()`))
+      .catch((error: unknown) => new Error(String(error))),
     new Promise<undefined>(resolve => setTimeout(resolve, ACT_TIMEOUT_MS))
   ])
 
@@ -313,7 +520,17 @@ async function runJson(run: PreviewScriptRunner, code: string): Promise<Trip> {
     return { error: 'The page did not answer the action.', kind: 'failed' }
   }
 
-  return { kind: 'answered', result: JSON.parse(raw) as PreviewActResult }
+  try {
+    const result: unknown = JSON.parse(raw)
+
+    if (!phaseResult(result, phase)) {
+      return { error: 'The page returned an invalid action result.', kind: 'failed' }
+    }
+
+    return { kind: 'answered', result }
+  } catch {
+    return { error: 'The page returned malformed JSON.', kind: 'failed' }
+  }
 }
 
 /** Past tense of the verb the agent asked for, against what it actually hit. */
@@ -341,53 +558,57 @@ async function driveAction(
 ): Promise<PreviewActResult> {
   // A key press must not be preceded by a click — that would activate the
   // control rather than type into it — so the page hands it focus instead.
-  const trip = await runJson(run, buildLocateScript(action, action.kind === 'press'))
+  const trip = await runJson(run, buildLocateScript(action, action.kind === 'press'), 'locate')
 
-  if (trip.kind === 'failed') {
-    return { error: trip.error, success: false }
-  }
-
-  if (trip.kind === 'silent') {
-    return { acted: action.kind, note: NAVIGATED, success: true }
+  if (trip.kind !== 'answered') {
+    return beforeInputFailure(trip.kind === 'failed' ? trip.error : 'The page did not answer preflight.')
   }
 
   const found = trip.result
 
   if (!found.success) {
-    return found
+    return beforeInputFailure(found.error || 'The target could not be located.', found)
   }
 
   if (!found.point) {
-    return { error: 'Could not work out where that element is on screen.', success: false }
+    return beforeInputFailure('Could not work out where that element is on screen.', found)
   }
 
-  await glideTo(input, found.point)
+  if (action.kind === 'type' && found.typable === false) {
+    return beforeInputFailure(
+      `${String(found.acted || 'That').replace(/^looking at /, '')} is not a text field, so typing into it would only select the text under the pointer. Click it if it opens one, then type into that.`,
+      found
+    )
+  }
 
-  if (action.kind === 'click') {
-    await clickAt(input)
-  } else if (action.kind === 'type') {
-    if (found.typable === false) {
-      return {
-        error: `${String(found.acted || 'That').replace(/^looking at /, '')} is not a text field, so typing into it would only select the text under the pointer. Click it if it opens one, then type into that.`,
-        success: false
+  let inputError: string | undefined
+
+  try {
+    await glideTo(input, found.point)
+
+    if (action.kind === 'click') {
+      await clickAt(input)
+    } else if (action.kind === 'type') {
+      input.focus()
+      await clickAt(input)
+      // Select-all inside the now-focused field, so typing replaces what is there
+      // the way it would for a person. NOT a triple-click: that is a pointer
+      // gesture and selects the paragraph under the cursor whenever the target
+      // turns out not to be a field.
+      await selectAll(input)
+      await typeText(input, action.text ?? '')
+
+      if (action.submit) {
+        await pressKey(input, 'Enter')
       }
+    } else if (action.kind === 'press') {
+      input.focus()
+      await pressKey(input, action.key || 'Enter')
     }
-
-    input.focus()
-    await clickAt(input)
-    // Select-all inside the now-focused field, so typing replaces what is there
-    // the way it would for a person. NOT a triple-click: that is a pointer
-    // gesture and selects the paragraph under the cursor whenever the target
-    // turns out not to be a field.
-    await selectAll(input)
-    await typeText(input, action.text ?? '')
-
-    if (action.submit) {
-      await pressKey(input, 'Enter')
-    }
-  } else if (action.kind === 'press') {
-    input.focus()
-    await pressKey(input, action.key || 'Enter')
+  } catch (error) {
+    // A throwing input channel may already have sent part of the gesture. Read
+    // back once, but never replay it or claim that nothing happened.
+    inputError = 'The input channel failed: ' + String(error)
   }
   // hover is the glide and nothing else — the pointer is already sitting on the
   // target, which is the whole request.
@@ -396,23 +617,20 @@ async function driveAction(
   const after = await runJson(run, buildFinishScript(SETTLE_MS))
   const acted = describeDone(action, target)
 
-  // The action itself already happened as real input, so a page that will not
-  // answer the read-back is a page that navigated — never a failed click.
   if (after.kind !== 'answered') {
-    return { acted, note: NAVIGATED, success: true }
+    return indeterminate(inputError || (after.kind === 'failed' ? after.error : 'The page did not answer readback.'))
   }
 
   const { hit, ...result } = after.result as PreviewActResult & { hit?: { tag: string; trusted: boolean } | null }
 
-  // The witness the locate trip armed. No record means the input never reached
-  // the document, which the agent must hear about — every other signal here
-  // travels on the script channel and would report success regardless.
-  if (!hit && CLICKS.indexOf(action.kind) !== -1) {
-    return {
-      ...result,
-      error: 'The pointer input never reached the page, so nothing was ' + acted.split(' ')[0] + '.',
-      success: false
-    }
+  if (inputError || !result.success) {
+    return indeterminate(inputError || result.error || 'The page could not be re-read.', found, result)
+  }
+
+  // A missing witness can mean navigation discarded it, not that nothing was
+  // clicked. Synthetic pointerdowns cannot witness real input either.
+  if (hit?.trusted !== true && CLICKS.indexOf(action.kind) !== -1) {
+    return indeterminate('No trusted click witness was available.', found, result)
   }
 
   return { ...result, acted, note: hitNote(hit), success: true }
@@ -434,8 +652,11 @@ ${preamble()}
   return Promise.resolve(JSON.stringify({
     page: Math.round(window.innerHeight * 0.9),
     point: { x: Math.round(window.innerWidth / 2), y: Math.round(track / 2) },
+    viewport: { width: window.innerWidth, height: window.innerHeight },
     span: sc.scrollHeight - track,
-    success: true
+    success: true,
+    title: document.title,
+    url: window.location.href
   }));
 })()`
 }
@@ -449,36 +670,52 @@ async function driveScroll(
   input: PreviewInputHandle,
   action: PreviewActAction
 ): Promise<PreviewActResult> {
-  const far = action.amount ?? 0
+  const trip = await runJson(run, buildScrollAnchorScript(), 'scroll')
 
-  const trip = await runJson(run, buildScrollAnchorScript())
-
-  if (trip.kind === 'failed') {
-    return { error: trip.error, success: false }
-  }
-
-  if (trip.kind === 'silent') {
-    return { acted: 'scrolled', note: NAVIGATED, success: true }
+  if (trip.kind !== 'answered') {
+    return beforeInputFailure(trip.kind === 'failed' ? trip.error : 'The page did not answer preflight.')
   }
 
   const anchor = trip.result as PreviewActResult & { page?: number; span?: number }
 
+  if (!anchor.success) {
+    return beforeInputFailure(anchor.error || 'The scroll anchor could not be read.', anchor)
+  }
+
+  const amount = action.amount ?? anchor.page
+
+  // wheelBy rounds cumulative notches; validate the effective amount BEFORE
+  // it can move the pointer. Signed distances preserve scrolling upward.
+  if (!finite(amount) || Math.abs(amount) > MAX_DOM_PIXELS) {
+    return beforeInputFailure('The scroll amount is outside the native input range.')
+  }
+
   if (!anchor.span) {
-    return { ...anchor, acted: 'scrolled the page', note: 'The page has nothing to scroll — it all fits already.' }
+    return { ...anchor, note: 'The page has nothing to scroll — it all fits already. No input was sent.' }
   }
 
-  // A person does not move the mouse to scroll; the wheel turns wherever their
-  // hand already is. Only send it somewhere if it has never been anywhere.
-  if (!pointerPlaced() && anchor.point) {
-    await glideTo(input, anchor.point)
-  }
+  let inputError: string | undefined
 
-  await wheelBy(input, action.amount ?? anchor.page ?? 600)
+  try {
+    // A person does not move the mouse to scroll; the wheel turns wherever their
+    // hand already is. Only send it somewhere if it has never been anywhere.
+    if (!pointerPlaced() && anchor.point) {
+      await glideTo(input, anchor.point)
+    }
+
+    await wheelBy(input, amount)
+  } catch (error) {
+    inputError = 'The input channel failed: ' + String(error)
+  }
 
   const after = await runJson(run, buildFinishScript(SETTLE_MS))
 
   if (after.kind !== 'answered') {
-    return { acted: 'scrolled the page', note: NAVIGATED, success: true }
+    return indeterminate(inputError || (after.kind === 'failed' ? after.error : 'The page did not answer readback.'))
+  }
+
+  if (inputError || !after.result.success) {
+    return indeterminate(inputError || after.result.error || 'The page could not be re-read.', anchor, after.result)
   }
 
   return { ...after.result, acted: 'scrolled the page', success: true }
@@ -489,6 +726,25 @@ async function driveScroll(
  *  the in-page engine. */
 export async function actOnActivePreview(
   action: Omit<PreviewActAction, 'kind'> & { kind: string }
+): Promise<PreviewActResult> {
+  const flight = beginPreviewAction()
+
+  if (!flight) {
+    return beforeInputFailure(
+      'Another preview operation is still in flight (possibly unresolved guest work). Wait for it to settle, then observe again.'
+    )
+  }
+
+  try {
+    return await performPreviewAction(action, flight.track)
+  } finally {
+    flight.finish()
+  }
+}
+
+async function performPreviewAction(
+  action: Omit<PreviewActAction, 'kind'> & { kind: string },
+  track: (run: PreviewScriptRunner) => PreviewScriptRunner
 ): Promise<PreviewActResult> {
   const nav = NAV_ACTIONS.find(verb => verb === action.kind)
 
@@ -506,12 +762,13 @@ export async function actOnActivePreview(
     return { acted: nav, note: 'Page is loading — call elements to see what is on it.', success: true }
   }
 
-  const run = activePreviewScriptRunner()
+  const runner = activePreviewScriptRunner()
 
-  if (!run) {
+  if (!runner) {
     return { error: NOTHING_OPEN, success: false }
   }
 
+  const run = track(runner)
   const typed = action as PreviewActAction
 
   // Annotation, not interaction: nothing is clicked, nothing settles, and the
@@ -526,13 +783,11 @@ export async function actOnActivePreview(
             ? buildPinScript(typed, typed.text || '')
             : buildUnpinScript(typed)
 
-    const trip = await runJson(run, mark)
+    const trip = await runJson(run, mark, typed.kind === 'hold' || typed.kind === 'strobe' ? 'inventory' : 'annotation')
 
-    if (trip.kind === 'failed') {
-      return { error: trip.error, success: false }
-    }
-
-    return trip.kind === 'answered' ? trip.result : { acted: typed.kind, note: NAVIGATED, success: true }
+    return trip.kind === 'answered'
+      ? trip.result
+      : indeterminate(trip.kind === 'failed' ? trip.error : 'The page did not answer the annotation.')
   }
 
   const input = activePreviewInput()
@@ -552,13 +807,19 @@ export async function actOnActivePreview(
   const settle = typed.kind === 'elements' ? 0 : SETTLE_MS
   const scripted = await runJson(run, buildScriptedScript(typed, settle))
 
-  if (scripted.kind === 'failed') {
-    return { error: scripted.error, success: false }
+  if (scripted.kind !== 'answered') {
+    const error = scripted.kind === 'failed' ? scripted.error : 'The page did not answer.'
+
+    return typed.kind === 'elements'
+      ? { error, note: 'Call elements for a fresh readback.', success: false }
+      : indeterminate(error)
   }
 
-  // The action almost certainly landed — a page that stops answering right
-  // after a click is one that navigated. Say so instead of failing it.
-  return scripted.kind === 'silent' ? { acted: typed.kind, note: NAVIGATED, success: true } : scripted.result
+  if (typed.kind !== 'elements' && scripted.result.success && !scripted.result.acted) {
+    return indeterminate('The page returned no action acknowledgement.', undefined, scripted.result)
+  }
+
+  return scripted.result
 }
 
 // Self-accept so an edit here, or to the in-page sources this module

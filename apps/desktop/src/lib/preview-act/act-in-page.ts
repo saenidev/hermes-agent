@@ -102,23 +102,65 @@ export function actInPageCore(
   const still = !!(win && win.matchMedia && win.matchMedia('(prefers-reduced-motion: reduce)').matches)
   const glide: ScrollBehavior = still ? 'auto' : 'smooth'
 
+  const contentEditable = (el: Element): boolean => {
+    const native = (el as HTMLElement).isContentEditable
+
+    if (typeof native === 'boolean') {
+      return native
+    }
+
+    // DOM implementations without isContentEditable still expose the HTML
+    // attribute. Invalid/missing tokens inherit, and an explicit false stops it.
+    for (let node: Element | null = el; node; node = node.parentElement) {
+      const token = node.getAttribute('contenteditable')?.toLowerCase()
+
+      if (token === '' || token === 'true' || token === 'plaintext-only') {
+        return true
+      }
+
+      if (token === 'false') {
+        return false
+      }
+    }
+
+    return false
+  }
+
+  const editingOf = (el: Element) => {
+    const inputType = el.tagName === 'INPUT' ? (el as HTMLInputElement).type : ''
+    const readOnly = (el as HTMLInputElement).readOnly === true
+
+    // Native text entry, not a role that might describe a select or custom
+    // popup. Pickers, toggles and file inputs are not generic text fields.
+    const textField = inputType
+      ? ['text', 'search', 'email', 'url', 'tel', 'password', 'number'].includes(inputType)
+      : el.tagName === 'TEXTAREA' || contentEditable(el)
+
+    return {
+      editable: textField && !readOnly && !el.matches(':disabled') && !el.closest('[inert]'),
+      input_type: inputType,
+      read_only: readOnly
+    }
+  }
+
   /** Walk the page and hand back what is interactable, in document order. The
    *  handles are assigned afterwards, by `survey`. */
   const sight = (max: number) => {
     const nodes: Element[] = []
     const field: Element[] = []
     const elements: PreviewElement[] = []
+    let truncated = false
 
     const candidates = doc.querySelectorAll(
       'a[href], button, input:not([type="hidden"]), select, textarea, summary, label[for], ' +
         '[role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], ' +
         '[role="menuitem"], [role="switch"], [role="option"], [role="combobox"], [role="searchbox"], ' +
-        '[role="textbox"], [contenteditable=""], [contenteditable="true"], [onclick], ' +
+        '[role="textbox"], [contenteditable=""], [contenteditable="true"], [contenteditable="plaintext-only"], [onclick], ' +
         '[tabindex]:not([tabindex="-1"])'
     )
 
     for (const el of candidates) {
-      if (elements.length >= max && field.length >= maxMarks) {
+      if (truncated && field.length >= maxMarks) {
         break
       }
 
@@ -133,14 +175,9 @@ export function actInPageCore(
         field.push(el)
       }
 
-      if (elements.length >= max) {
+      if (truncated) {
         continue
       }
-
-      const tag = el.tagName.toLowerCase()
-
-      const role =
-        el.getAttribute('role') || (tag === 'input' ? 'input:' + ((el as HTMLInputElement).type || 'text') : tag)
 
       const label = labelOf(el)
       const value = valueOf(el)
@@ -154,7 +191,21 @@ export function actInPageCore(
         continue
       }
 
+      // Equality with the cap is not truncation. Probe one more eligible
+      // control, without minting a ref or retaining it in the inventory.
+      if (elements.length >= max) {
+        truncated = true
+
+        continue
+      }
+
+      const tag = el.tagName.toLowerCase()
+
+      const role =
+        el.getAttribute('role') || (tag === 'input' ? 'input:' + ((el as HTMLInputElement).type || 'text') : tag)
+
       const entry: PreviewElement = {
+        ...editingOf(el),
         label,
         // Filled in by `survey`, which is what knows whether this element
         // already has a handle.
@@ -168,7 +219,7 @@ export function actInPageCore(
         entry.selector = selector
       }
 
-      if ((el as HTMLInputElement).disabled) {
+      if (el.matches(':disabled')) {
         entry.disabled = true
       }
 
@@ -183,7 +234,7 @@ export function actInPageCore(
     holder.nodes = nodes
     holder.field = field
 
-    return { elements, nodes }
+    return { elements, nodes, truncated }
   }
 
   /** Look at the page and say what is there — or, once there is something to
@@ -201,10 +252,12 @@ export function actInPageCore(
     if (fresh) {
       holder.book = []
       holder.coined = {}
+      holder.reserved = new Set()
     }
 
     const book = holder.book || (holder.book = [])
     const coined = holder.coined || (holder.coined = {})
+    const reserved = holder.reserved || (holder.reserved = new Set(book.map(bound => bound.ref)))
     const seen = sight(max)
     const claimed: Record<string, boolean> = {}
     const kept: PreviewActBinding[] = []
@@ -243,9 +296,12 @@ export function actInPageCore(
         continue
       }
 
+      bound.editable = entry.editable
+      bound.input_type = entry.input_type
       bound.label = entry.label
       bound.name = entry.label || entry.value || ''
       bound.off = !!entry.disabled
+      bound.read_only = entry.read_only
       bound.value = entry.value || ''
       changed.push(moved)
     }
@@ -261,11 +317,14 @@ export function actInPageCore(
       const el = seen.nodes[i]
 
       const now: PreviewActBinding = {
+        editable: entry.editable,
         el,
+        input_type: entry.input_type,
         label: entry.label,
         name: entry.label || entry.value || '',
         off: !!entry.disabled,
         path: anchorOf(el),
+        read_only: entry.read_only,
         ref: '',
         role: entry.role,
         stable: stableOf(el),
@@ -291,25 +350,33 @@ export function actInPageCore(
       }
 
       if (best) {
-        // Same handle, new node. Reported as one word rather than a removal
-        // and an addition, because from the agent's side nothing happened —
-        // its handle still works and it has nothing to re-read.
+        // Same handle, new node. Compare before updating the binding: a
+        // re-render can also change the fields the agent already knows.
+        const moved = shifted(best, entry)
+
         entry.ref = best.ref
+        best.editable = now.editable
         best.el = el
+        best.input_type = now.input_type
         best.label = now.label
         best.name = now.name
         best.off = now.off
         best.path = now.path
+        best.read_only = now.read_only
         best.stable = now.stable
         best.value = now.value
         claimed[best.ref] = true
         kept.push(best)
         rebound.push(best.ref)
 
+        if (moved) {
+          changed.push(moved)
+        }
+
         continue
       }
 
-      now.ref = coin(coined, entry.role, now.name)
+      now.ref = coin(coined, reserved, entry.role, now.name)
       entry.ref = now.ref
       claimed[now.ref] = true
       kept.push(now)
@@ -345,7 +412,7 @@ export function actInPageCore(
     const churn = added.length + changed.length
 
     if (fresh || action.full || churn * 2 >= seen.elements.length) {
-      return { elements: seen.elements, success: true }
+      return { elements: seen.elements, full: true, success: true, truncated: seen.truncated }
     }
 
     const delta: PreviewActDelta = { same }
@@ -366,7 +433,7 @@ export function actInPageCore(
       delta.rebound = rebound
     }
 
-    return { delta, success: true }
+    return { delta, full: false, success: true, truncated: seen.truncated }
   }
 
   /** Resolve the action's target: a handle from the book, else a selector. */
@@ -381,7 +448,13 @@ export function actInPageCore(
         }
       }
 
-      const bound = (holder.book || []).filter(entry => entry.ref === ref)[0]
+      const matches = (holder.book || []).filter(entry => entry.ref === ref)
+
+      if (matches.length > 1) {
+        return { error: 'Ambiguous element ' + ref + '. Reload the page and call elements for new refs.' }
+      }
+
+      const bound = matches[0]
 
       if (!bound) {
         return { error: 'Unknown element ' + ref + '. Call elements to get current refs.' }
@@ -488,7 +561,6 @@ export function actInPageCore(
     }
 
     const spot = pointAt(el)
-    const tag = el.tagName
 
     return answer({
       acted: 'looking at ' + describe(el),
@@ -497,7 +569,7 @@ export function actInPageCore(
       // Real typing starts with a triple-click to clear the field. On anything
       // that is not a field that gesture selects the paragraph under it
       // instead, which is how the agent ended up highlighting whole pages.
-      typable: tag === 'TEXTAREA' || tag === 'INPUT' || el.isContentEditable === true
+      typable: editingOf(el).editable
     })
   }
 
@@ -525,7 +597,7 @@ export function actInPageCore(
     return answer({ acted: 'hovered over ' + describe(el), success: true })
   }
 
-  if ((el as HTMLInputElement).disabled) {
+  if (el.matches(':disabled')) {
     return fail(describe(el) + ' is disabled.')
   }
 
@@ -550,14 +622,25 @@ export function actInPageCore(
 
   if (action.kind === 'type') {
     const text = action.text ?? ''
+    const editing = editingOf(el)
 
-    const editable = el.isContentEditable || (el.getAttribute('contenteditable') ?? 'false') !== 'false'
+    if (!editing.editable) {
+      if (editing.read_only) {
+        return fail(describe(el) + ' is read-only.')
+      }
+
+      if (el.tagName === 'SELECT') {
+        return fail(describe(el) + ' is a dropdown — click it and click the option you want.')
+      }
+
+      return fail(describe(el) + ' is not a text field.')
+    }
 
     el.focus()
 
-    if (editable) {
+    if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') {
       el.textContent = text
-    } else if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+    } else {
       // Assign through the prototype's setter: React (and anything else that
       // tracks the DOM value) shadows `value` with its own accessor and ignores
       // an input event whose value it thinks it already wrote, so a plain
@@ -570,10 +653,6 @@ export function actInPageCore(
       } else {
         ;(el as HTMLInputElement).value = text
       }
-    } else if (el.tagName === 'SELECT') {
-      return fail(describe(el) + ' is a dropdown — click it and click the option you want.')
-    } else {
-      return fail(describe(el) + ' is not a text field.')
     }
 
     el.dispatchEvent(new Event('input', { bubbles: true }))

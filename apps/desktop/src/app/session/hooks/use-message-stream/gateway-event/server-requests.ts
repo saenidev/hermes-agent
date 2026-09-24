@@ -344,6 +344,7 @@ const previewAct: Handler = ({ isActiveSession, request }) => {
     .then(run =>
       run({
         amount: p.amount as never,
+        full: p.full as PreviewActAction['full'],
         key: p.key as never,
         kind: (str(p.action) || '') as never,
         max: p.max as never,

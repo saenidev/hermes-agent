@@ -14,8 +14,14 @@
 export interface PreviewElement {
   /** Present and true only when the control is non-interactive right now. */
   disabled?: boolean
+  /** Whether this DOM node currently accepts text entry, independent of ARIA role. */
+  editable?: boolean
+  /** Native input.type (including password), or '' for a non-input node. */
+  input_type?: string
   /** Human-readable label (aria-label, text, placeholder, value …). */
   label: string
+  /** Native readOnly state; false for nodes without that property. */
+  read_only?: boolean
   /** Durable handle for as long as this page is open: 'btn-sign-in'. Legible on
    *  purpose — see the ref-minting note in `actInPage`. */
   ref: string
@@ -37,7 +43,10 @@ export interface PreviewElement {
 export interface PreviewElementChange {
   /** Present only when the control's availability flipped. */
   disabled?: boolean
+  editable?: boolean
+  input_type?: string
   label?: string
+  read_only?: boolean
   ref: string
   value?: string
 }
@@ -47,12 +56,12 @@ export interface PreviewElementChange {
 export interface PreviewActDelta {
   /** Elements seen for the first time, in full. */
   added?: PreviewElement[]
-  /** Same handle, new label/value/disabled state — and nothing else. */
+  /** Same handle, changed label/value/availability or editing capability. */
   changed?: PreviewElementChange[]
   /** Handles that are gone from the page. */
   removed?: string[]
   /** Handles whose element was destroyed and recreated by a re-render. The
-   *  handle still works; nothing about them needs re-reading. */
+   *  handle still works; any changed fields are also reported in `changed`. */
   rebound?: string[]
   /** How many handles were on the page and untouched. */
   same?: number
@@ -88,15 +97,23 @@ export interface PreviewActResult {
   /** What moved since the last look. Present INSTEAD of `elements` once the
    *  agent holds a baseline for this page. */
   delta?: PreviewActDelta
-  /** The full inventory. Sent on the first look at a page, and again whenever
-   *  the page changed too much for a delta to be the cheaper answer. */
+  /** The current capped inventory. Sent on the first look at a page, and again
+   *  whenever the page changed too much for a delta to be the cheaper answer. */
   elements?: PreviewElement[]
   error?: string
+  /** elements: true for an inventory, false for a delta. Not a completeness
+   *  claim — either format may be truncated. */
+  full?: boolean
   note?: string
   /** Viewport centre of a located target, for aiming real pointer input at it. */
   point?: { x: number; y: number }
+  /** Fresh guest CSS viewport accompanying native locate/scroll preflight. */
+  viewport?: { width: number; height: number }
   success: boolean
   title?: string
+  /** elements: at least one eligible control was omitted by the cap. Present
+   *  on both inventory and delta responses. */
+  truncated?: boolean
   /** locate: whether the target actually takes typed text. */
   typable?: boolean
   /** Live document URL after the action — a change means it navigated. */
@@ -105,7 +122,10 @@ export interface PreviewActResult {
 
 /** One element the agent has a handle on, remembered across actions. */
 export interface PreviewActBinding {
+  /** Editing capability at the last look, for field-level deltas. */
+  editable?: boolean
   el: Element
+  input_type?: string
   /** What it read as last time. Kept field by field rather than as one hash so
    *  a change can be reported as only the part that moved. */
   label: string
@@ -116,6 +136,7 @@ export interface PreviewActBinding {
   off: boolean
   /** Nearest-landmark path plus position among same-role siblings. */
   path: string
+  read_only?: boolean
   ref: string
   role: string
   /** `id` / `name` / `data-testid` / `aria-label`, if the page provides one.
@@ -141,6 +162,9 @@ export interface PreviewActHolder {
    *  the inventory's size. */
   field?: Element[]
   nodes?: Element[]
+  /** All final refs issued on this page, including retired ones. Different
+   *  stems can produce the same suffixed ref; only navigation releases it. */
+  reserved?: Set<string>
   /** URL the snapshot was taken on; a navigation retires every handle. */
   url?: string
 }

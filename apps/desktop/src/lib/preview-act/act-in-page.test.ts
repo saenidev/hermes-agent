@@ -108,6 +108,55 @@ describe('elements', () => {
     expect(inventory(holder).elements?.map(e => e.ref)).toEqual(['btn-edit', 'btn-edit-1', 'btn-edit-2'])
   })
 
+  it.each([false, true])('keeps final refs unique for colliding stems until navigation (reverse=%s)', reverse => {
+    // Non-Latin labels share the bare btn stem; a numeric or suffix-shaped
+    // label can independently mint exactly the suffix that stem will use.
+    const labels = [...Array<string>(12).fill('ค้นหา'), '10 กม.', 'Edit', 'Edit', 'Edit 1', 'Edit 1 1']
+
+    if (reverse) {
+      labels.reverse()
+    }
+
+    const markup = (generation: string) =>
+      labels.map((label, i) => `<button id="${generation}-${i}">${label}</button>`).join('')
+
+    const holder = page(markup('first'))
+    const first = inventory(holder).elements!
+    const refs = first.map(entry => entry.ref)
+
+    expect(new Set(refs).size).toBe(first.length)
+    expect(holder.book?.map(bound => bound.ref)).toEqual(refs)
+
+    for (const entry of first) {
+      const node = document.querySelector(entry.selector!)!
+      const clicked = vi.fn()
+      node.addEventListener('click', clicked)
+      expect(actInPage(document, holder, { kind: 'click', ref: entry.ref }).success).toBe(true)
+      expect(clicked).toHaveBeenCalledOnce()
+    }
+
+    // Rebinding is still stable, even when all the DOM nodes are new.
+    document.body.innerHTML = markup('first')
+    expect(actInPage(document, holder, { full: true, kind: 'elements' }).elements?.map(entry => entry.ref)).toEqual(
+      refs
+    )
+
+    document.body.replaceChildren()
+    inventory(holder)
+    document.body.innerHTML = markup('next')
+    const next = inventory(holder).elements!
+
+    expect(new Set(next.map(entry => entry.ref)).size).toBe(next.length)
+    expect(next.every(entry => !refs.includes(entry.ref))).toBe(true)
+
+    for (const ref of refs) {
+      expect(actInPage(document, holder, { kind: 'click', ref }).success).toBe(false)
+    }
+
+    holder.url = 'https://elsewhere.example/other'
+    expect(inventory(holder).elements?.map(entry => entry.ref)).toEqual(refs)
+  })
+
   // Handing a retired name to a different element would silently redirect a
   // handle the agent is still holding. The two ids here also disagree, which is
   // the page saying outright that these are different buttons — so this must
@@ -140,6 +189,74 @@ describe('elements', () => {
     expect(email).toMatchObject({ label: 'Email', role: 'input:email', value: 'a@b.co' })
     expect(go).toMatchObject({ disabled: true, label: 'Go' })
     expect(email.disabled).toBeUndefined()
+  })
+
+  it('derives editing capability from the DOM, not the combobox role', () => {
+    const holder = page(`
+      <input id="maps" role="combobox" aria-label="Search Maps" />
+      <input id="readonly" role="combobox" aria-label="Read only" readonly />
+      <input id="disabled" role="combobox" aria-label="Disabled" disabled />
+      <fieldset disabled><input id="fieldset" role="combobox" aria-label="Disabled by fieldset" /></fieldset>
+      <select id="select" role="combobox" aria-label="Choose"><option>One</option></select>
+      <div id="custom" role="combobox" tabindex="0">Choose</div>
+      <input id="checkbox" type="checkbox" role="combobox" aria-label="Check" />
+      <input id="file" type="file" role="combobox" aria-label="Upload" />
+      <input id="number" type="number" role="combobox" aria-label="Number" />
+      <input id="password" type="password" role="combobox" aria-label="Password" />
+      <textarea id="textarea" role="combobox" aria-label="Message"></textarea>
+      <textarea id="locked-textarea" role="combobox" aria-label="Locked message" readonly></textarea>
+      <div id="editor" contenteditable="true" role="combobox" aria-label="Editor"></div>
+      <div id="plain" contenteditable="plaintext-only" aria-label="Plain editor"></div>
+      <div contenteditable="true">
+        <span id="inherited" role="combobox" aria-label="Inherited editor"></span>
+        <span id="blocked" contenteditable="false" role="combobox" aria-label="Not an editor"></span>
+      </div>
+    `)
+
+    // Exercise the injected entry point too: capability helpers must travel
+    // with the engine rather than rely on renderer module scope.
+    const injected = new Function('return ' + actEngineSource())() as typeof actInPage
+    const elements = injected(document, holder, { kind: 'elements' }).elements!
+
+    const cases: [string, boolean, string, boolean, boolean][] = [
+      ['maps', true, 'text', false, false],
+      ['readonly', false, 'text', true, false],
+      ['disabled', false, 'text', false, true],
+      ['fieldset', false, 'text', false, true],
+      ['select', false, '', false, false],
+      ['custom', false, '', false, false],
+      ['checkbox', false, 'checkbox', false, false],
+      ['file', false, 'file', false, false],
+      ['number', true, 'number', false, false],
+      ['password', true, 'password', false, false],
+      ['textarea', true, '', false, false],
+      ['locked-textarea', false, '', true, false],
+      ['editor', true, '', false, false],
+      ['plain', true, '', false, false],
+      ['inherited', true, '', false, false],
+      ['blocked', false, '', false, false]
+    ]
+
+    for (const [id, editable, inputType, readOnly, disabled] of cases) {
+      const entry = elements.find(element => element.selector === '#' + id)!
+
+      expect(entry, id).toMatchObject({ editable, input_type: inputType, read_only: readOnly })
+      expect(!!entry.disabled, id).toBe(disabled)
+      expect(injected(document, holder, { kind: 'locate', ref: entry.ref }).typable, id).toBe(editable)
+
+      // Inventory identifies passwords without changing their handling.
+      if (inputType === 'password') {
+        continue
+      }
+
+      const node = document.getElementById(id)!
+      const input = vi.fn()
+      node.addEventListener('input', input)
+      const result = injected(document, holder, { kind: 'type', ref: entry.ref, text: '123' })
+
+      expect(result.success, id).toBe(editable)
+      expect(input.mock.calls.length, id).toBe(editable ? 1 : 0)
+    }
   })
 
   it('skips hidden controls and unlabelled ones', () => {
@@ -253,12 +370,82 @@ describe('elements', () => {
     expect(inventory(holder).elements).toHaveLength(10)
     expect(actInPage(document, holder, { full: true, kind: 'elements', max: 3 }).elements).toHaveLength(3)
   })
+
+  it('marks truncation only when another eligible control exceeds the cap', () => {
+    const holder = page(`
+      <button id="one">One</button><button id="two">Two</button>
+      <button style="display: none">Hidden</button>
+      <div inert><button>Inert</button></div>
+      <p>Not interactive</p>
+      ${'<button></button>'.repeat(600)}
+    `)
+
+    const look = (full = false, max = 3) => actInPage(document, holder, { full, kind: 'elements', max })
+
+    expect(look()).toMatchObject({ full: true, truncated: false })
+    document.body.insertAdjacentHTML('afterbegin', '<button id="three">Three</button>')
+    const exact = look(true)
+    const refs = exact.elements!.map(entry => entry.ref)
+
+    // Unlabelled controls fill the overlay, but do not imply truncation even
+    // when the inventory itself has exactly max entries.
+    expect(exact).toMatchObject({ full: true, truncated: false })
+    expect(exact.elements).toHaveLength(3)
+    expect(holder.field).toHaveLength(600)
+    expect(look()).toMatchObject({ delta: { same: 3 }, full: false, truncated: false })
+
+    document.body.insertAdjacentHTML('beforeend', '<button id="extra">Extra</button>')
+    const extra = document.getElementById('extra')!
+    const capped = look()
+
+    // The extra eligible node lies AFTER the overlay cap. It is probed, not
+    // offered or given a handle until a later, larger inventory includes it.
+    expect(capped).toMatchObject({ delta: { same: 3 }, full: false, truncated: true })
+    expect(capped.delta?.added).toBeUndefined()
+    expect(capped.elements).toBeUndefined()
+    expect(holder.nodes).not.toContain(extra)
+    expect(holder.book?.map(bound => bound.ref)).toEqual(refs)
+    expect(holder.reserved?.size).toBe(refs.length)
+    const full = look(true)
+    expect(full).toMatchObject({ full: true, truncated: true })
+    expect(full.elements?.map(entry => entry.ref)).toEqual(refs)
+
+    const expanded = look(false, 4)
+    expect(expanded).toMatchObject({ full: false, truncated: false })
+    expect(expanded.delta?.added?.map(entry => entry.selector)).toEqual(['#extra'])
+    expect(holder.nodes).toContain(extra)
+    expect(holder.book?.map(bound => bound.ref)).toEqual([...refs, expanded.delta!.added![0].ref])
+  })
 })
 
 // Re-sending the whole inventory after every click is what made a ten-step
 // session cost several times what it needed to: the page barely moves between
 // steps and the agent was charged for a fresh copy of it each time.
 describe('delta', () => {
+  it('marks the actual inventory format, including automatic full fallbacks', () => {
+    const holder = page('<button id="save">Save</button><button>Undo</button><button>Redo</button>')
+    const first = inventory(holder)
+    const delta = inventory(holder)
+    const requested = actInPage(document, holder, { full: true, kind: 'elements' })
+
+    document.body.innerHTML = '<a href="/a">A</a><a href="/b">B</a><a href="/c">C</a>'
+    const churned = inventory(holder)
+    holder.url = 'https://elsewhere.example/other'
+    const navigated = inventory(holder)
+    document.body.replaceChildren()
+    const empty = inventory(holder)
+
+    for (const result of [first, requested, churned, navigated, empty]) {
+      expect(result).toMatchObject({ full: true, truncated: false })
+      expect(result.elements).toBeDefined()
+      expect(result.delta).toBeUndefined()
+    }
+
+    expect(delta).toMatchObject({ delta: { same: 3 }, full: false, truncated: false })
+    expect(delta.elements).toBeUndefined()
+    expect(empty.elements).toEqual([])
+  })
+
   it('gives the full inventory the first time it looks at a page', () => {
     const holder = page('<button>Save</button>')
     const first = inventory(holder)
@@ -342,6 +529,56 @@ describe('delta', () => {
     ;(document.getElementById('go') as HTMLButtonElement).disabled = false
 
     expect(inventory(holder).delta?.changed).toEqual([{ disabled: false, ref: 'btn-continue' }])
+  })
+
+  it.each([false, true])('keeps editing metadata coherent in deltas (replace=%s)', replace => {
+    const holder = page(`
+      <input id="q" role="combobox" aria-label="Search" />
+      <a href="/help">Help</a>
+      <a href="/terms">Terms</a>
+    `)
+
+    const injected = new Function('return ' + actEngineSource())() as typeof actInPage
+    let expected = injected(document, holder, { kind: 'elements' }).elements![0]
+    const { ref } = expected
+
+    const steps = [
+      [{ readOnly: true }, { editable: false, read_only: true }],
+      [{ type: 'email' }, { input_type: 'email' }],
+      [{ readOnly: false }, { editable: true, read_only: false }],
+      [{ type: 'date' }, { editable: false, input_type: 'date' }],
+      [{ type: 'text' }, { editable: true, input_type: 'text' }],
+      [
+        { disabled: true, value: 'before' },
+        { disabled: true, editable: false, value: 'before' }
+      ],
+      [
+        { disabled: false, value: '' },
+        { disabled: false, editable: true, value: '' }
+      ]
+    ] as const
+
+    for (const [properties, changed] of steps) {
+      const current = document.querySelector<HTMLInputElement>('#q')!
+      const input = replace ? (current.cloneNode(true) as HTMLInputElement) : current
+      Object.assign(input, properties)
+
+      if (replace) {
+        current.replaceWith(input)
+      }
+
+      const next = injected(document, holder, { kind: 'elements' })
+      expected = { ...expected, ...changed }
+
+      expect(next.elements).toBeUndefined()
+      expect(next.delta?.changed).toEqual([{ ref, ...changed }])
+      expect(next.delta?.rebound).toEqual(replace ? [ref] : undefined)
+      expect(next.delta?.same).toBe(2)
+      expect(next.delta?.added).toBeUndefined()
+      expect(next.delta?.removed).toBeUndefined()
+      expect(injected(document, holder, { kind: 'locate', ref }).typable).toBe(expected.editable)
+      expect(injected(document, holder, { kind: 'elements' }).delta).toEqual({ same: 3 })
+    }
   })
 
   it('falls back to the whole inventory when most of the page is new', () => {
@@ -549,6 +786,25 @@ describe('click', () => {
 })
 
 describe('stale refs', () => {
+  it('rejects an ambiguous ref without locating or activating either node', () => {
+    const holder = page('<button id="first">First</button><button id="second">Second</button>')
+    const [first] = inventory(holder).elements!
+    // A retained book from the old allocator can contain duplicate final refs.
+    holder.book![1].ref = first.ref
+    const clicked = vi.fn()
+    document.querySelectorAll('button').forEach(button => button.addEventListener('click', clicked))
+
+    for (const kind of ['click', 'locate'] as const) {
+      const result = actInPage(document, holder, { kind, ref: first.ref })
+
+      expect(result.success).toBe(false)
+      expect(result.error).toMatch(/ambiguous/i)
+      expect(holder.aimed).toBeUndefined()
+    }
+
+    expect(clicked).not.toHaveBeenCalled()
+  })
+
   it('names an unknown ref rather than acting on whatever is nearby', () => {
     const holder = page('<button>Only</button>')
     inventory(holder)

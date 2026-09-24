@@ -27,7 +27,7 @@ export interface IdentityKit {
   /** Do two labels share at least half their words? */
   alike(a: string, b: string): boolean
   /** Mint a handle, disambiguating against the ones already minted. */
-  coin(coined: Record<string, number>, role: string, name: string): string
+  coin(coined: Record<string, number>, reserved: Set<string>, role: string, name: string): string
   /** What moved on an element that kept its handle, or null if it held still. */
   shifted(was: PreviewActBinding, entry: PreviewElement): null | PreviewElementChange
 }
@@ -41,7 +41,14 @@ export function identityKit(naming: NamingKit): IdentityKit {
     const off = !!entry.disabled
     const value = entry.value || ''
 
-    if (was.label === entry.label && was.value === value && was.off === off) {
+    if (
+      was.label === entry.label &&
+      was.value === value &&
+      was.off === off &&
+      was.editable === entry.editable &&
+      was.input_type === entry.input_type &&
+      was.read_only === entry.read_only
+    ) {
       return null
     }
 
@@ -57,6 +64,18 @@ export function identityKit(naming: NamingKit): IdentityKit {
 
     if (was.off !== off) {
       moved.disabled = off
+    }
+
+    if (was.editable !== entry.editable) {
+      moved.editable = entry.editable
+    }
+
+    if (was.input_type !== entry.input_type) {
+      moved.input_type = entry.input_type
+    }
+
+    if (was.read_only !== entry.read_only) {
+      moved.read_only = entry.read_only
     }
 
     return moved
@@ -115,14 +134,23 @@ export function identityKit(naming: NamingKit): IdentityKit {
    *  send it back to an inventory twenty thousand tokens ago. Suffixes are
    *  never rewound, so a retired handle's name is not later handed to a
    *  different element on the same page. */
-  const coin = (coined: Record<string, number>, role: string, name: string): string => {
+  const coin = (coined: Record<string, number>, reserved: Set<string>, role: string, name: string): string => {
     const named = naming.slug(name)
     const stem = naming.stemOf(role) + (named ? '-' + named : '')
-    const nth = coined[stem] || 0
+    let nth = coined[stem] || 0
+    let ref = nth ? stem + '-' + nth : stem
+
+    // Stems share one namespace: btn + suffix 10 and the label "10 กม."
+    // both produce btn-10. Reserve the final ref, not just its stem's count.
+    while (reserved.has(ref)) {
+      nth++
+      ref = stem + '-' + nth
+    }
 
     coined[stem] = nth + 1
+    reserved.add(ref)
 
-    return nth ? stem + '-' + nth : stem
+    return ref
   }
 
   return { affinity, alike, coin, shifted }

@@ -34,17 +34,53 @@ export type PreviewInputEvent =
 export interface PreviewInputHandle {
   /** Give the guest keyboard focus, so key events reach its active element. */
   focus: () => void
+  /** Whether a guest CSS point survives conversion to native input space. The
+   *  real pane answers from its live zoom; absent means no extra constraint. */
+  accepts?: (point: { x: number; y: number }) => boolean
   send: (event: PreviewInputEvent) => void
 }
 
+/** Electron hands pointer coordinates to Chromium as signed 32-bit ints. */
+const MAX_INPUT_PIXEL = 2 ** 31 - 1
+
+const zoomOf = (zoomFactor: number | undefined) =>
+  zoomFactor && Number.isFinite(zoomFactor) && zoomFactor > 0 ? zoomFactor : 1
+
+const inputPixel = (value: number, zoom: number) => {
+  const scaled = Math.round(value * zoom)
+
+  return Number.isFinite(value) && value >= 0 && Number.isSafeInteger(scaled) && scaled <= MAX_INPUT_PIXEL
+    ? scaled
+    : undefined
+}
+
+/** Whether a guest CSS point still fits the native input range at this zoom.
+ *  The act engine asks BEFORE it moves the pointer, so an unsendable target is
+ *  refused without a partial gesture. */
+export function webviewAcceptsPoint(point: { x: number; y: number }, zoomFactor: number | undefined): boolean {
+  const zoom = zoomOf(zoomFactor)
+
+  return inputPixel(point.x, zoom) !== undefined && inputPixel(point.y, zoom) !== undefined
+}
+
 /** Convert a point the act engine measured in guest CSS pixels into the
- *  webview's input space. Key events carry no point and pass through. */
+ *  webview's input space. Key events carry no point and pass through. A point
+ *  that would leave the native range after scaling throws rather than reaching
+ *  sendInputEvent — callers validate first, this is the last line. */
 export function toWebviewInputSpace(event: PreviewInputEvent, zoomFactor: number | undefined): PreviewInputEvent {
-  if (!('x' in event) || !zoomFactor || !Number.isFinite(zoomFactor) || zoomFactor <= 0 || zoomFactor === 1) {
+  if (!('x' in event)) {
     return event
   }
 
-  return { ...event, x: Math.round(event.x * zoomFactor), y: Math.round(event.y * zoomFactor) }
+  const zoom = zoomOf(zoomFactor)
+  const x = inputPixel(event.x, zoom)
+  const y = inputPixel(event.y, zoom)
+
+  if (x === undefined || y === undefined) {
+    throw new RangeError('preview input point is outside the native input range')
+  }
+
+  return zoom === 1 ? event : { ...event, x, y }
 }
 
 const handles = new Map<string, PreviewInputHandle>()

@@ -31,7 +31,16 @@ import { actEngineSource, type PreviewActAction, type PreviewActResult } from '@
 import { watchInPage } from '@/lib/preview-act/watch-in-page'
 
 import { beginPreviewAction } from './preview-action-flight'
-import { clickAt, glideTo, pointerPlaced, pressKey, selectAll, typeText, wheelBy } from './preview-drive'
+import {
+  clickAt,
+  glideTo,
+  keepPointerWithin,
+  pointerPlaced,
+  pressKey,
+  selectAll,
+  typeText,
+  wheelBy
+} from './preview-drive'
 import { activePreviewInput, type PreviewInputHandle } from './preview-input'
 import { activePreviewNav, type PreviewNavHandle } from './preview-nav'
 import { activePreviewScriptRunner, type PreviewScriptRunner } from './preview-script-runner'
@@ -533,6 +542,25 @@ async function runJson(run: PreviewScriptRunner, code: string, phase: Phase = 'i
   }
 }
 
+/** The last check before any pointer input: a remembered pointer the freshly
+ *  measured viewport no longer contains is forgotten (so neither a wheel nor
+ *  the start of a glide uses it), and the target must survive the pane's own
+ *  CSS→native conversion at its live zoom. Returns why input must not be sent,
+ *  or undefined. Runs before the first event, so a refusal is never partial. */
+function pointerGate(input: PreviewInputHandle, at: PreviewActResult): string | undefined {
+  if (!at.viewport || !at.point) {
+    return 'Could not work out where that element is on screen.'
+  }
+
+  keepPointerWithin(at.viewport)
+
+  if (input.accepts && !input.accepts(at.point)) {
+    return 'That spot is outside the native input range at the current zoom. No input was sent.'
+  }
+
+  return undefined
+}
+
 /** Past tense of the verb the agent asked for, against what it actually hit. */
 function describeDone(action: PreviewActAction, target: string): string {
   if (action.kind === 'type') {
@@ -579,6 +607,12 @@ async function driveAction(
       `${String(found.acted || 'That').replace(/^looking at /, '')} is not a text field, so typing into it would only select the text under the pointer. Click it if it opens one, then type into that.`,
       found
     )
+  }
+
+  const gate = pointerGate(input, found)
+
+  if (gate) {
+    return beforeInputFailure(gate, found)
   }
 
   let inputError: string | undefined
@@ -694,11 +728,18 @@ async function driveScroll(
     return { ...anchor, note: 'The page has nothing to scroll — it all fits already. No input was sent.' }
   }
 
+  const gate = pointerGate(input, anchor)
+
+  if (gate) {
+    return beforeInputFailure(gate, anchor)
+  }
+
   let inputError: string | undefined
 
   try {
     // A person does not move the mouse to scroll; the wheel turns wherever their
-    // hand already is. Only send it somewhere if it has never been anywhere.
+    // hand already is. Only send it somewhere if it has never been anywhere, or
+    // if the pane shrank out from under where it was (pointerGate forgot it).
     if (!pointerPlaced() && anchor.point) {
       await glideTo(input, anchor.point)
     }

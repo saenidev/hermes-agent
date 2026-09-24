@@ -53,6 +53,19 @@ export function pointerPlaced(): boolean {
   return placed
 }
 
+/** Forget the remembered pointer unless it lies inside `viewport` (guest CSS
+ *  px, freshly measured by the calling action). The pane can shrink between
+ *  actions, and a remembered spot that is now off the page must not become a
+ *  wheel origin or the start of a glide. Returns whether it is still placed. */
+export function keepPointerWithin(viewport: { width: number; height: number }): boolean {
+  if (placed && (pointer.x > viewport.width || pointer.y > viewport.height)) {
+    pointer = { x: 0, y: 0 }
+    placed = false
+  }
+
+  return placed
+}
+
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 /** Decelerating, like a hand arriving at a target rather than a linear sweep. */

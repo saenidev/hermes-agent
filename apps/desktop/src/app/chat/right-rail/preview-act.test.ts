@@ -7,7 +7,7 @@ import { $rightRailActiveTabId } from '@/store/layout'
 import { closeRightRail, openPreview, type PreviewTarget } from '@/store/preview'
 
 import { actOnActivePreview } from './preview-act'
-import { registerPreviewInput } from './preview-input'
+import { registerPreviewInput, webviewAcceptsPoint } from './preview-input'
 import { registerPreviewNav } from './preview-nav'
 import { registerPreviewScriptRunner } from './preview-script-runner'
 
@@ -635,6 +635,97 @@ describe('actOnActivePreview (drive_preview tool)', () => {
     // Electron's wheel delta is wheelDelta-signed, so scrolling DOWN is negative.
     expect(wheels.every(event => event.deltaY < 0)).toBe(true)
     expect(scripted).toBe(false)
+  })
+
+  // The pointer is remembered between actions, but the viewport is not fixed:
+  // after the pane shrinks, the remembered spot can be off the page. Neither the
+  // wheel origin nor the start of the next glide may use a spot outside the
+  // FRESH viewport this action just measured.
+  it('never wheels or glides from a remembered pointer the resized viewport no longer contains', async () => {
+    const tabId = openBrowserTab()
+    const send = vi.fn()
+    let view = { width: 1024, height: 768 }
+    let hoverAt = { x: 900, y: 700 }
+
+    cleanups.push(
+      registerPreviewScriptRunner(tabId, async code => {
+        if (code.includes('scrollHeight')) {
+          return JSON.stringify({
+            page: Math.round(view.height * 0.9),
+            point: { x: Math.round(view.width / 2), y: Math.round(view.height / 2) },
+            viewport: view,
+            span: 4_000,
+            success: true
+          })
+        }
+
+        return code.includes('"kind":"locate"')
+          ? JSON.stringify({ acted: 'looking at link "Map"', point: hoverAt, viewport: view, success: true })
+          : JSON.stringify({ elements: [], full: true, truncated: false, hit: null, success: true })
+      })
+    )
+    cleanups.push(registerPreviewInput(tabId, { focus: vi.fn(), send }))
+
+    const inside = (event: { x: number; y: number }) => event.x <= view.width && event.y <= view.height
+
+    expect(await actOnActivePreview({ kind: 'hover', ref: '@e1' })).toMatchObject({ success: true })
+
+    view = { width: 320, height: 300 }
+    send.mockClear()
+    expect(await actOnActivePreview({ kind: 'scroll' })).toMatchObject({ success: true })
+
+    const pointed = send.mock.calls.map(([event]) => event).filter(event => 'x' in event)
+
+    expect(pointed.filter(event => event.type === 'mouseWheel').length).toBeGreaterThan(1)
+    expect(pointed.every(inside)).toBe(true)
+
+    view = { width: 100, height: 100 }
+    hoverAt = { x: 40, y: 40 }
+    send.mockClear()
+    expect(await actOnActivePreview({ kind: 'hover', ref: '@e1' })).toMatchObject({ success: true })
+    expect(
+      send.mock.calls
+        .map(([event]) => event)
+        .filter(event => 'x' in event)
+        .every(inside)
+    ).toBe(true)
+  })
+
+  it('refuses before any input when the pane says the target will not fit its native input range', async () => {
+    const tabId = openBrowserTab()
+    const send = vi.fn()
+
+    cleanups.push(
+      registerPreviewScriptRunner(tabId, async code =>
+        code.includes('"kind":"locate"')
+          ? JSON.stringify({
+              acted: 'looking at link "Far"',
+              point: { x: 2_147_483_646, y: 10 },
+              viewport: { width: 2_147_483_647, height: 768 },
+              success: true
+            })
+          : JSON.stringify({ elements: [], full: true, truncated: false, hit: null, success: true })
+      )
+    )
+    cleanups.push(
+      registerPreviewInput(tabId, {
+        accepts: point => webviewAcceptsPoint(point, 1.25),
+        focus: vi.fn(),
+        send
+      })
+    )
+
+    for (const action of [
+      { kind: 'click', ref: '@e1' },
+      { kind: 'hover', ref: '@e1' }
+    ]) {
+      const result = await actOnActivePreview(action)
+
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('native input range')
+    }
+
+    expect(send).not.toHaveBeenCalled()
   })
 
   it('says so plainly when the page has nothing to scroll', async () => {
